@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal)
+HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Stealth/Xvfb)
 """
 import argparse
 import csv
@@ -18,19 +18,19 @@ from pathlib import Path
 import requests
 
 # ----------------------------- KONFIGURATION ---------------------------------
-SHEET_ID = os.getenv("SHEET_ID", "1MG0UwMZbmFoSxCdVp8pqspM5wgtgQlJGyoVesRXd5ag")          # aus der Sheet-URL: /d/<ID>/edit
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://script.google.com/macros/s/AKfycbx2Ed3LMH0NOQY9qawf3UC3-Kp2uZbaSKSu4RvTR54dLGvHEtFIGMP1NVzy3ifGMMaUWA/exec")  # Apps-Script-Web-App (/exec)
-WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "123456789")    # gleiches Token wie im Apps Script
-BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "msedge")             # "msedge", "chrome" oder "chromium"
-API_HINT = os.getenv("API_HINT", "all-offers-service")               # Teil der URL des Angebots-Abrufs
+SHEET_ID = os.getenv("SHEET_ID", "1MG0UwMZbmFoSxCdVp8pqspM5wgtgQlJGyoVesRXd5ag")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://script.google.com/macros/s/AKfycbx2Ed3LMH0NOQY9qawf3UC3-Kp2uZbaSKSu4RvTR54dLGvHEtFIGMP1NVzy3ifGMMaUWA/exec")
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "123456789")
+BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "msedge")
+API_HINT = os.getenv("API_HINT", "all-offers-service")
 PRICE_KEYS = [k.strip().lower() for k in os.getenv("PRICE_KEYS", "amount,totalprice,price").split(",")]
 # -----------------------------------------------------------------------------
 
-MIN_OK, MAX_OK = 400, 20000          # plausibler Gesamtpreis (2 Pers., 7 Nächte) in EUR
-PAUSE_HOTEL = (6, 14)                # Sekunden zufällige Pause zwischen Hotels
-PAUSE_BLOCK = (60, 90)               # längere Pause nach je 25 Hotels
-MAX_CONSECUTIVE_FAILS = 6            # danach Abbruch (nicht weiter hämmern)
-WAIT_FOR_API_S = 40                  # max. Wartezeit auf den Angebots-Abruf pro Hotel
+MIN_OK, MAX_OK = 400, 20000
+PAUSE_HOTEL = (10, 20)
+PAUSE_BLOCK = (60, 90)
+MAX_CONSECUTIVE_FAILS = 6
+WAIT_FOR_API_S = 40
 
 BASE = Path(__file__).resolve().parent
 PROFILE_DIR = BASE / "browser_profile"
@@ -40,7 +40,6 @@ BACKUP_CSV = BASE / "preishistorie_backup.csv"
 
 # ------------------------------ Hotelliste -----------------------------------
 def load_hotels(xlsx: str | None) -> list[tuple[str, str]]:
-    """Liest Reiter 'hotels' (Spalten: id, name, ..., active, url)."""
     if xlsx:
         import openpyxl
         ws = openpyxl.load_workbook(xlsx, read_only=True, data_only=True)["hotels"]
@@ -69,7 +68,6 @@ def load_hotels(xlsx: str | None) -> list[tuple[str, str]]:
 
 # ------------------------------ Preis-Parser ---------------------------------
 def walk(obj, path=""):
-    """Liefert (Pfad, Blattwert) für jedes Blatt eines verschachtelten JSON."""
     if isinstance(obj, dict):
         for k, v in obj.items():
             yield from walk(v, f"{path}.{k}")
@@ -101,7 +99,6 @@ def to_number(v):
 
 
 def extract_price(payloads: list) -> tuple[float | None, str]:
-    """Sucht gezielt nach dem echten Gesamtpreis (totalPrice.amount) der Urlaubsangebote."""
     found = []
     for data in payloads:
         offers = data.get("data", {}).get("offers", [])
@@ -128,7 +125,6 @@ def extract_price(payloads: list) -> tuple[float | None, str]:
 
 
 def price_like_fields(payloads: list) -> dict:
-    """Für --probe: alle Felder, die nach Preis aussehen, mit Anzahl/min/max."""
     stats = defaultdict(list)
     for data in payloads:
         for path, v in walk(data):
@@ -143,20 +139,40 @@ def price_like_fields(payloads: list) -> dict:
 # ------------------------------ Browser --------------------------------------
 def open_context(p, show: bool):
     PROFILE_DIR.mkdir(exist_ok=True)
+    
+    launch_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--disable-features=IsolateOrigins,site-per-process",
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--window-size=1920,1080",
+    ]
+    
     kwargs = {
         "headless": not show,
         "locale": "de-DE",
         "timezone_id": "Europe/Berlin",
-        "viewport": {"width": 1366, "height": 900},
+        "viewport": {"width": 1920, "height": 1080},
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "args": launch_args,
     }
+    
     if BROWSER_CHANNEL and BROWSER_CHANNEL != "chromium":
         kwargs["channel"] = BROWSER_CHANNEL
         
-    return p.chromium.launch_persistent_context(str(PROFILE_DIR), **kwargs)
+    ctx = p.chromium.launch_persistent_context(str(PROFILE_DIR), **kwargs)
+    
+    ctx.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined
+        });
+    """)
+    
+    return ctx
 
 
 def fetch_offers(ctx, url: str, probe: bool = False):
-    """Öffnet die Hotelseite und sammelt JSON-Antworten des Angebots-Abrufs."""
     page = ctx.new_page()
     hits, seen = [], []
 
