@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Stealth/Xvfb)
+Inklusive Bewertungs-Auslese (Rating/Rec) und 20-Minuten-Turbo.
 """
 import argparse
 import csv
@@ -26,10 +27,10 @@ API_HINT = os.getenv("API_HINT", "all-offers-service")
 PRICE_KEYS = [k.strip().lower() for k in os.getenv("PRICE_KEYS", "amount,totalprice,price").split(",")]
 # -----------------------------------------------------------------------------
 
-MIN_OK, MAX_OK = 400, 20000
-PAUSE_HOTEL = (10, 20)
-PAUSE_BLOCK = (60, 90)
-MAX_CONSECUTIVE_FAILS = 6
+MIN_OK, MAX_OK = 1000, 20000       # Filter: Ignoriert Preise unter 1000 € (verhindert 1-Personen-Fehler)
+PAUSE_HOTEL = (4, 8)               # Turbo: Nur 4-8 Sekunden Pause zwischen den Hotels
+PAUSE_BLOCK = (15, 25)             # Turbo: Kürzere Pause nach je 25 Hotels
+MAX_CONSECUTIVE_FAILS = 12         # Turbo: Bricht erst nach 12 blockierten Hotels in Folge ab
 WAIT_FOR_API_S = 40
 
 BASE = Path(__file__).resolve().parent
@@ -301,7 +302,7 @@ def mode_run(hotels, show: bool) -> int:
                         break
                 except Exception as e:
                     details = f"fehler={type(e).__name__}"
-                time.sleep(random.uniform(5, 10))
+                time.sleep(random.uniform(2, 4)) # Turbo: Kürzere Wartezeit bei Neuversuch
 
             if price is not None:
                 rows.append([ts, name, price, details])
