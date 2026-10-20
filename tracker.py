@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Stealth/Xvfb)
-Inklusive präziser Bewertungs-Auslese (Rating/Rec/Count ohne Werbebanner-Fehler), 
-Ressourcen-Blocker und Extreme-Turbo.
+Inklusive präziser Bewertungs-Auslese via DOM-Selektor (ohne Werbebanner-Fehler).
 """
 import argparse
 import csv
@@ -120,17 +119,6 @@ def extract_price(payloads: list) -> tuple[float | None, str]:
         return min(found), f"feld=totalPrice;n={len(found)}"
     return None, ""
 
-def price_like_fields(payloads: list) -> dict:
-    stats = defaultdict(list)
-    for data in payloads:
-        for path, v in walk(data):
-            k = last_key(path)
-            if any(t in k for t in ("price", "preis", "amount", "total", "sum")):
-                n = to_number(v)
-                if n is not None:
-                    stats[k].append(n)
-    return {k: (len(v), min(v), max(v)) for k, v in stats.items()}
-
 # ------------------------------ Browser --------------------------------------
 def open_context(p, show: bool):
     PROFILE_DIR.mkdir(exist_ok=True)
@@ -160,7 +148,6 @@ def fetch_offers(ctx, url: str, probe: bool = False):
     page = ctx.new_page()
     hits, seen = [], []
 
-    # --- Ressourcen blockieren für schnelles Laden ---
     def route_intercept(route):
         if route.request.resource_type in ("image", "media", "font", "stylesheet"):
             route.abort()
@@ -201,30 +188,33 @@ def fetch_offers(ctx, url: str, probe: bool = False):
             except Exception:
                 pass
                 
-        # --- PRÄZISE BEWERTUNGS-AUSLESE (SCHUTZ VOR WERBEBANNERN) ---
+        # --- 100% PRÄZISE AUSLESE DIREKT AUS DEM REVIEW-BADGE ---
         rating, rec, count = "", "", ""
         try:
-            body_text = page.evaluate("document.body.innerText")
-            
-            # 1. Sonnen-Bewertung (z.B. 5,8 / 6)
-            bew_match = re.search(r'(\d[.,]\d)\s*/\s*6', body_text)
-            if bew_match: 
-                rating = bew_match.group(1).replace(',', '.')
-
-            # 2. Weiterempfehlung: Sucht gezielt nach dem direkten Kontext oder realistischen Werten
-            rec_match = re.search(r'(\d{2,3})\s*%\s*(?:Weiterempf|Empf)', body_text, re.IGNORECASE)
-            if not rec_match:
-                valid_recs = re.findall(r'\b([7-9]\d|100)\s*%', body_text)
-                if valid_recs:
-                    rec = valid_recs[0]
-            else:
-                rec = rec_match.group(1)
-
-            # 3. Anzahl der Bewertungen
-            cnt_match = re.search(r'([\d.]+)\s*(?:Hotelbewertungen|Bewertungen)', body_text, re.IGNORECASE)
-            if cnt_match: 
-                count = cnt_match.group(1).replace('.', '')
+            rating, rec, count = page.evaluate(r"""() => {
+                let ratingText = "", recText = "", countText = "";
                 
+                // Exakt das Element anvisieren
+                const reviewBar = document.querySelector('[data-trackid="hotel-review-bar"]') || document.querySelector('.HotelReviewBar');
+                
+                if (reviewBar) {
+                    const text = reviewBar.innerText;
+                    
+                    // Weiterempfehlung (z.B. "95%")
+                    const recMatch = text.match(/(\d{2,3})\s*%/);
+                    if (recMatch) recText = recMatch[1];
+                    
+                    // Sonnen (z.B. "5,5 / 6")
+                    const sunMatch = text.match(/([0-9][.,][0-9])\s*\/\s*6/);
+                    if (sunMatch) ratingText = sunMatch[1].replace(',', '.');
+                    
+                    // Anzahl Bewertungen (z.B. "5.832 Bewertungen")
+                    const countMatch = text.match(/([\d.]+)\s*Bewertungen/i);
+                    if (countMatch) countText = countMatch[1].replace(/\./g, '');
+                }
+                
+                return [ratingText, recText, countText];
+            }""")
         except Exception:
             pass
             
