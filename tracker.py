@@ -201,13 +201,26 @@ def fetch_offers(ctx, url: str, probe: bool = False):
             page.wait_for_timeout(3000)
         if not hits and re.search(r"access denied|zugriff verweigert", page.title() or "", re.I):
             blocked = True
+            
         payloads = []
         for r in hits:
             try:
                 payloads.append(r.json())
             except Exception:
                 pass
-        return payloads, blocked, seen
+                
+        # --- BEWERTUNG & EMPFEHLUNG AUSLESEN ---
+        rating, rec = "", ""
+        try:
+            body_text = page.evaluate("document.body.innerText")
+            bew_match = re.search(r'(\d[.,]\d)\s*/\s*6', body_text)
+            rec_match = re.search(r'(\d{2,3})\s*%', body_text)
+            if bew_match: rating = bew_match.group(1).replace(',', '.')
+            if rec_match: rec = rec_match.group(1)
+        except Exception:
+            pass
+            
+        return payloads, blocked, seen, rating, rec
     finally:
         page.close()
 
@@ -231,9 +244,10 @@ def mode_probe(hotels, show: bool):
     DEBUG_DIR.mkdir(exist_ok=True)
     with sync_playwright() as p:
         ctx = open_context(p, show)
-        payloads, blocked, seen = fetch_offers(ctx, url, probe=True)
+        payloads, blocked, seen, rating, rec = fetch_offers(ctx, url, probe=True)
         ctx.close()
     print(f"Blockiert: {blocked}")
+    print(f"Bewertung gefunden: {rating} / 6 | Empfehlung: {rec}%")
     print(f"JSON-Hintergrundabrufe gesehen ({len(seen)}):")
     for status, u in seen:
         print(f"  {status}  {u[:160]}")
@@ -279,9 +293,11 @@ def mode_run(hotels, show: bool) -> int:
             price, details, blocked = None, "", False
             for attempt in (1, 2):
                 try:
-                    payloads, blocked, _ = fetch_offers(ctx, url)
+                    payloads, blocked, _, rating, rec = fetch_offers(ctx, url)
                     price, details = extract_price(payloads)
                     if price is not None or blocked:
+                        if rating or rec:
+                            details = f"{details}|rating={rating}|rec={rec}"
                         break
                 except Exception as e:
                     details = f"fehler={type(e).__name__}"
