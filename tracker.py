@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Stealth/Xvfb)
-Inklusive Bewertungs-Auslese (Rating/Rec) und 20-Minuten-Turbo.
+Inklusive Bewertungs-Auslese (Rating/Rec), Ressourcen-Blocker und Extreme-Turbo.
 """
 import argparse
 import csv
@@ -28,9 +28,9 @@ PRICE_KEYS = [k.strip().lower() for k in os.getenv("PRICE_KEYS", "amount,totalpr
 # -----------------------------------------------------------------------------
 
 MIN_OK, MAX_OK = 1000, 20000       # Filter: Ignoriert Preise unter 1000 € (verhindert 1-Personen-Fehler)
-PAUSE_HOTEL = (4, 8)               # Turbo: Nur 4-8 Sekunden Pause zwischen den Hotels
-PAUSE_BLOCK = (15, 25)             # Turbo: Kürzere Pause nach je 25 Hotels
-MAX_CONSECUTIVE_FAILS = 12         # Turbo: Bricht erst nach 12 blockierten Hotels in Folge ab
+PAUSE_HOTEL = (2, 4)               # Extreme-Turbo: Nur noch 2-4 Sekunden Pause zwischen den Hotels
+PAUSE_BLOCK = (5, 10)              # Extreme-Turbo: Kürzere Pause nach je 25 Hotels
+MAX_CONSECUTIVE_FAILS = 15         # Extreme-Turbo: Bricht erst nach 15 blockierten Hotels in Folge ab
 WAIT_FOR_API_S = 40
 
 BASE = Path(__file__).resolve().parent
@@ -177,6 +177,16 @@ def fetch_offers(ctx, url: str, probe: bool = False):
     page = ctx.new_page()
     hits, seen = [], []
 
+    # --- NEU: Bilder, Videos und Design blockieren um Ladezeit zu halbieren ---
+    def route_intercept(route):
+        if route.request.resource_type in ("image", "media", "font", "stylesheet"):
+            route.abort()
+        else:
+            route.continue_()
+    
+    page.route("**/*", route_intercept)
+    # --------------------------------------------------------------------------
+
     def on_response(resp):
         try:
             if resp.request.resource_type not in ("xhr", "fetch"):
@@ -199,7 +209,7 @@ def fetch_offers(ctx, url: str, probe: bool = False):
         while time.time() - t0 < WAIT_FOR_API_S and not hits:
             page.wait_for_timeout(500)
         if hits:
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(2000)
         if not hits and re.search(r"access denied|zugriff verweigert", page.title() or "", re.I):
             blocked = True
             
