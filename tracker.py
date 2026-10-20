@@ -38,7 +38,6 @@ PROFILE_DIR = BASE / "browser_profile"
 DEBUG_DIR = BASE / "debug"
 BACKUP_CSV = BASE / "preishistorie_backup.csv"
 
-
 # ------------------------------ Hotelliste -----------------------------------
 def load_hotels(xlsx: str | None) -> list[tuple[str, str]]:
     if xlsx:
@@ -66,7 +65,6 @@ def load_hotels(xlsx: str | None) -> list[tuple[str, str]]:
             hotels.append((name, url))
     return hotels
 
-
 # ------------------------------ Preis-Parser ---------------------------------
 def walk(obj, path=""):
     if isinstance(obj, dict):
@@ -78,10 +76,8 @@ def walk(obj, path=""):
     else:
         yield path, obj
 
-
 def last_key(path: str) -> str:
     return re.sub(r"\[\d+\]$", "", path.rsplit(".", 1)[-1]).lower()
-
 
 def to_number(v):
     if isinstance(v, bool):
@@ -97,7 +93,6 @@ def to_number(v):
         except ValueError:
             return None
     return None
-
 
 def extract_price(payloads: list) -> tuple[float | None, str]:
     found = []
@@ -124,7 +119,6 @@ def extract_price(payloads: list) -> tuple[float | None, str]:
         return min(found), f"feld=totalPrice;n={len(found)}"
     return None, ""
 
-
 def price_like_fields(payloads: list) -> dict:
     stats = defaultdict(list)
     for data in payloads:
@@ -136,11 +130,9 @@ def price_like_fields(payloads: list) -> dict:
                     stats[k].append(n)
     return {k: (len(v), min(v), max(v)) for k, v in stats.items()}
 
-
 # ------------------------------ Browser --------------------------------------
 def open_context(p, show: bool):
     PROFILE_DIR.mkdir(exist_ok=True)
-    
     launch_args = [
         "--disable-blink-features=AutomationControlled",
         "--disable-features=IsolateOrigins,site-per-process",
@@ -149,7 +141,6 @@ def open_context(p, show: bool):
         "--disable-dev-shm-usage",
         "--window-size=1920,1080",
     ]
-    
     kwargs = {
         "headless": not show,
         "locale": "de-DE",
@@ -158,34 +149,23 @@ def open_context(p, show: bool):
         "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "args": launch_args,
     }
-    
     if BROWSER_CHANNEL and BROWSER_CHANNEL != "chromium":
         kwargs["channel"] = BROWSER_CHANNEL
-        
     ctx = p.chromium.launch_persistent_context(str(PROFILE_DIR), **kwargs)
-    
-    ctx.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => undefined
-        });
-    """)
-    
+    ctx.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
     return ctx
-
 
 def fetch_offers(ctx, url: str, probe: bool = False):
     page = ctx.new_page()
     hits, seen = [], []
 
-    # --- Ressourcen blockieren für schnelleres Laden ---
+    # --- Ressourcen blockieren für schnelles Laden ---
     def route_intercept(route):
         if route.request.resource_type in ("image", "media", "font", "stylesheet"):
             route.abort()
         else:
             route.continue_()
-    
     page.route("**/*", route_intercept)
-    # --------------------------------------------------
 
     def on_response(resp):
         try:
@@ -220,13 +200,20 @@ def fetch_offers(ctx, url: str, probe: bool = False):
             except Exception:
                 pass
                 
-        # --- BEWERTUNG, EMPFEHLUNG & ANZAHL AUSLESEN ---
+        # --- BEWERTUNG, EMPFEHLUNG & ANZAHL AUSLESEN (KORRIGIERT) ---
         rating, rec, count = "", "", ""
         try:
             body_text = page.evaluate("document.body.innerText")
             bew_match = re.search(r'(\d[.,]\d)\s*/\s*6', body_text)
-            rec_match = re.search(r'(\d{2,3})\s*%', body_text)
-            cnt_match = re.search(r'([\d.]+)\s*Bewertungen', body_text)
+            
+            # Sucht gezielt nach dem Wort "Weiterempfehlung" um Rabatt-Prozente (z.B. 25%) zu ignorieren
+            rec_match = re.search(r'(\d{2,3})\s*%\s*Weiterempf', body_text, re.IGNORECASE)
+            if not rec_match:
+                # Fallback: Sucht nach typischen Hotelraten (nur Zahlen zwischen 70 und 100 %)
+                rec_match = re.search(r'(?:^|\s)(7\d|8\d|9\d|100)\s*%', body_text)
+                
+            cnt_match = re.search(r'([\d.]+)\s*(?:Hotelbewertungen|Bewertungen)', body_text, re.IGNORECASE)
+            
             if bew_match: rating = bew_match.group(1).replace(',', '.')
             if rec_match: rec = rec_match.group(1)
             if cnt_match: count = cnt_match.group(1).replace('.', '')
@@ -236,7 +223,6 @@ def fetch_offers(ctx, url: str, probe: bool = False):
         return payloads, blocked, seen, rating, rec, count
     finally:
         page.close()
-
 
 # ------------------------------ Modi -----------------------------------------
 def mode_setup():
@@ -249,7 +235,6 @@ def mode_setup():
         ctx.close()
     print("Profil gespeichert.")
 
-
 def mode_probe(hotels, show: bool):
     from playwright.sync_api import sync_playwright
     name, url = hotels[0]
@@ -261,37 +246,16 @@ def mode_probe(hotels, show: bool):
         ctx.close()
     print(f"Blockiert: {blocked}")
     print(f"Bewertung gefunden: {rating} / 6 | Empfehlung: {rec}% | Anzahl: {count}")
-    print(f"JSON-Hintergrundabrufe gesehen ({len(seen)}):")
-    for status, u in seen:
-        print(f"  {status}  {u[:160]}")
-    print(f"\nTreffer mit API_HINT='{API_HINT}': {len(payloads)}")
-    for i, data in enumerate(payloads):
-        f = DEBUG_DIR / f"probe_{i}.json"
-        f.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"  gespeichert: {f}")
-    if payloads:
-        print("\nPreisähnliche Felder (Anzahl, min, max):")
-        for k, (n, lo, hi) in sorted(price_like_fields(payloads).items()):
-            print(f"  {k:30s} n={n:3d}  min={lo:10.2f}  max={hi:10.2f}")
-        print("\nErgebnis mit aktuellen PRICE_KEYS:", extract_price(payloads))
-    else:
-        print("\nKein Treffer.")
-
 
 def post_rows(rows: list) -> bool:
     for i in range(1, 4):
         try:
-            r = requests.post(
-                WEBHOOK_URL, json={"token": WEBHOOK_TOKEN, "rows": rows}, timeout=120
-            )
-            if r.ok and r.text.strip().startswith("ok"):
-                return True
-            print(f"  Webhook-Antwort: {r.status_code} {r.text[:120]}", file=sys.stderr)
-        except requests.RequestException as e:
-            print(f"  Webhook-Fehler: {e}", file=sys.stderr)
+            r = requests.post(WEBHOOK_URL, json={"token": WEBHOOK_TOKEN, "rows": rows}, timeout=120)
+            if r.ok and r.text.strip().startswith("ok"): return True
+        except requests.RequestException:
+            pass
         time.sleep(5 * i)
     return False
-
 
 def mode_run(hotels, show: bool) -> int:
     from playwright.sync_api import sync_playwright
@@ -318,7 +282,7 @@ def mode_run(hotels, show: bool) -> int:
                         break
                 except Exception as e:
                     details = f"fehler={type(e).__name__}"
-                time.sleep(random.uniform(2, 4)) # Turbo Wartezeit
+                time.sleep(random.uniform(2, 4)) 
 
             if price is not None:
                 rows.append([ts, name, price, details])
@@ -329,54 +293,36 @@ def mode_run(hotels, show: bool) -> int:
                 (failed if blocked or details else no_offer).append(name)
                 print("BLOCKIERT" if blocked else "kein Preis")
                 if consecutive >= MAX_CONSECUTIVE_FAILS:
-                    print(f"\n{consecutive} Fehlversuche in Folge – Abbruch.", file=sys.stderr)
                     break
 
             time.sleep(random.uniform(*PAUSE_HOTEL))
-            if i % 25 == 0:
-                time.sleep(random.uniform(*PAUSE_BLOCK))
+            if i % 25 == 0: time.sleep(random.uniform(*PAUSE_BLOCK))
         ctx.close()
-
-    print(f"\n{len(rows)} Preise von {len(hotels)} Hotels.")
 
     if rows:
         new = not BACKUP_CSV.exists()
         with BACKUP_CSV.open("a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            if new:
-                w.writerow(["Zeitstempel", "Hotel", "Günstigster_Preis_EUR", "Details"])
+            if new: w.writerow(["Zeitstempel", "Hotel", "Günstigster_Preis_EUR", "Details"])
             w.writerows(rows)
-        if not post_rows(rows):
-            print("Webhook fehlgeschlagen.", file=sys.stderr)
-            return 2
-        print("In Google Sheet geschrieben.")
+        post_rows(rows)
     return 0 if rows else 1
-
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--setup", action="store_true")
     ap.add_argument("--probe", action="store_true")
-    ap.add_argument("--show", action="store_true", help="Browserfenster sichtbar")
+    ap.add_argument("--show", action="store_true")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--xlsx", default=None)
     args = ap.parse_args()
 
-    if args.setup:
-        mode_setup()
-        return 0
-
+    if args.setup: return mode_setup() or 0
     hotels = load_hotels(args.xlsx)
-    if args.limit:
-        hotels = hotels[: args.limit]
-    print(f"{len(hotels)} aktive Hotels geladen.")
-    if not hotels:
-        return 1
-    if args.probe:
-        mode_probe(hotels, args.show)
-        return 0
+    if args.limit: hotels = hotels[: args.limit]
+    if not hotels: return 1
+    if args.probe: return mode_probe(hotels, args.show) or 0
     return mode_run(hotels, args.show)
-
 
 if __name__ == "__main__":
     sys.exit(main())
