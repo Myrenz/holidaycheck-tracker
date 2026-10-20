@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Stealth/Xvfb)
-Inklusive Bewertungs-Auslese (Rating/Rec), Ressourcen-Blocker und Extreme-Turbo.
+Inklusive Bewertungs-Auslese (Rating/Rec/Count), Ressourcen-Blocker und Extreme-Turbo.
 """
 import argparse
 import csv
@@ -27,7 +27,7 @@ API_HINT = os.getenv("API_HINT", "all-offers-service")
 PRICE_KEYS = [k.strip().lower() for k in os.getenv("PRICE_KEYS", "amount,totalprice,price").split(",")]
 # -----------------------------------------------------------------------------
 
-MIN_OK, MAX_OK = 1000, 20000       # Filter: Ignoriert Preise unter 1000 € (verhindert 1-Personen-Fehler)
+MIN_OK, MAX_OK = 1000, 20000       # Filter: Ignoriert Preise unter 1000 €
 PAUSE_HOTEL = (2, 4)               # Extreme-Turbo: Nur noch 2-4 Sekunden Pause zwischen den Hotels
 PAUSE_BLOCK = (5, 10)              # Extreme-Turbo: Kürzere Pause nach je 25 Hotels
 MAX_CONSECUTIVE_FAILS = 15         # Extreme-Turbo: Bricht erst nach 15 blockierten Hotels in Folge ab
@@ -177,7 +177,7 @@ def fetch_offers(ctx, url: str, probe: bool = False):
     page = ctx.new_page()
     hits, seen = [], []
 
-    # --- NEU: Bilder, Videos und Design blockieren um Ladezeit zu halbieren ---
+    # --- Ressourcen blockieren für schnelleres Laden ---
     def route_intercept(route):
         if route.request.resource_type in ("image", "media", "font", "stylesheet"):
             route.abort()
@@ -185,7 +185,7 @@ def fetch_offers(ctx, url: str, probe: bool = False):
             route.continue_()
     
     page.route("**/*", route_intercept)
-    # --------------------------------------------------------------------------
+    # --------------------------------------------------
 
     def on_response(resp):
         try:
@@ -220,18 +220,20 @@ def fetch_offers(ctx, url: str, probe: bool = False):
             except Exception:
                 pass
                 
-        # --- BEWERTUNG & EMPFEHLUNG AUSLESEN ---
-        rating, rec = "", ""
+        # --- BEWERTUNG, EMPFEHLUNG & ANZAHL AUSLESEN ---
+        rating, rec, count = "", "", ""
         try:
             body_text = page.evaluate("document.body.innerText")
             bew_match = re.search(r'(\d[.,]\d)\s*/\s*6', body_text)
             rec_match = re.search(r'(\d{2,3})\s*%', body_text)
+            cnt_match = re.search(r'([\d.]+)\s*Bewertungen', body_text)
             if bew_match: rating = bew_match.group(1).replace(',', '.')
             if rec_match: rec = rec_match.group(1)
+            if cnt_match: count = cnt_match.group(1).replace('.', '')
         except Exception:
             pass
             
-        return payloads, blocked, seen, rating, rec
+        return payloads, blocked, seen, rating, rec, count
     finally:
         page.close()
 
@@ -255,10 +257,10 @@ def mode_probe(hotels, show: bool):
     DEBUG_DIR.mkdir(exist_ok=True)
     with sync_playwright() as p:
         ctx = open_context(p, show)
-        payloads, blocked, seen, rating, rec = fetch_offers(ctx, url, probe=True)
+        payloads, blocked, seen, rating, rec, count = fetch_offers(ctx, url, probe=True)
         ctx.close()
     print(f"Blockiert: {blocked}")
-    print(f"Bewertung gefunden: {rating} / 6 | Empfehlung: {rec}%")
+    print(f"Bewertung gefunden: {rating} / 6 | Empfehlung: {rec}% | Anzahl: {count}")
     print(f"JSON-Hintergrundabrufe gesehen ({len(seen)}):")
     for status, u in seen:
         print(f"  {status}  {u[:160]}")
@@ -304,15 +306,19 @@ def mode_run(hotels, show: bool) -> int:
             price, details, blocked = None, "", False
             for attempt in (1, 2):
                 try:
-                    payloads, blocked, _, rating, rec = fetch_offers(ctx, url)
+                    payloads, blocked, _, rating, rec, count = fetch_offers(ctx, url)
                     price, details = extract_price(payloads)
                     if price is not None or blocked:
-                        if rating or rec:
-                            details = f"{details}|rating={rating}|rec={rec}"
+                        extra_parts = []
+                        if rating: extra_parts.append(f"rating={rating}")
+                        if rec: extra_parts.append(f"rec={rec}")
+                        if count: extra_parts.append(f"count={count}")
+                        if extra_parts:
+                            details = f"{details}|{'|'.join(extra_parts)}"
                         break
                 except Exception as e:
                     details = f"fehler={type(e).__name__}"
-                time.sleep(random.uniform(2, 4)) # Turbo: Kürzere Wartezeit bei Neuversuch
+                time.sleep(random.uniform(2, 4)) # Turbo Wartezeit
 
             if price is not None:
                 rows.append([ts, name, price, details])
