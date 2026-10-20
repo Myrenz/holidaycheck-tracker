@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Stealth/Xvfb)
-Inklusive Bewertungs-Auslese (Rating/Rec/Count), Ressourcen-Blocker und Extreme-Turbo.
+Inklusive präziser Bewertungs-Auslese (Rating/Rec/Count ohne Werbebanner-Fehler), 
+Ressourcen-Blocker und Extreme-Turbo.
 """
 import argparse
 import csv
@@ -200,23 +201,30 @@ def fetch_offers(ctx, url: str, probe: bool = False):
             except Exception:
                 pass
                 
-        # --- BEWERTUNG, EMPFEHLUNG & ANZAHL AUSLESEN (KORRIGIERT) ---
+        # --- PRÄZISE BEWERTUNGS-AUSLESE (SCHUTZ VOR WERBEBANNERN) ---
         rating, rec, count = "", "", ""
         try:
             body_text = page.evaluate("document.body.innerText")
+            
+            # 1. Sonnen-Bewertung (z.B. 5,8 / 6)
             bew_match = re.search(r'(\d[.,]\d)\s*/\s*6', body_text)
-            
-            # Sucht gezielt nach dem Wort "Weiterempfehlung" um Rabatt-Prozente (z.B. 25%) zu ignorieren
-            rec_match = re.search(r'(\d{2,3})\s*%\s*Weiterempf', body_text, re.IGNORECASE)
+            if bew_match: 
+                rating = bew_match.group(1).replace(',', '.')
+
+            # 2. Weiterempfehlung: Sucht gezielt nach dem direkten Kontext oder realistischen Werten
+            rec_match = re.search(r'(\d{2,3})\s*%\s*(?:Weiterempf|Empf)', body_text, re.IGNORECASE)
             if not rec_match:
-                # Fallback: Sucht nach typischen Hotelraten (nur Zahlen zwischen 70 und 100 %)
-                rec_match = re.search(r'(?:^|\s)(7\d|8\d|9\d|100)\s*%', body_text)
-                
+                valid_recs = re.findall(r'\b([7-9]\d|100)\s*%', body_text)
+                if valid_recs:
+                    rec = valid_recs[0]
+            else:
+                rec = rec_match.group(1)
+
+            # 3. Anzahl der Bewertungen
             cnt_match = re.search(r'([\d.]+)\s*(?:Hotelbewertungen|Bewertungen)', body_text, re.IGNORECASE)
-            
-            if bew_match: rating = bew_match.group(1).replace(',', '.')
-            if rec_match: rec = rec_match.group(1)
-            if cnt_match: count = cnt_match.group(1).replace('.', '')
+            if cnt_match: 
+                count = cnt_match.group(1).replace('.', '')
+                
         except Exception:
             pass
             
