@@ -1,40 +1,42 @@
-name: HolidayCheck Daily Tracker
+name: HolidayCheck Tracker
 
 on:
+  workflow_dispatch: # Erlaubt dir weiterhin den manuellen Start per Button
   schedule:
-    - cron: '30 7 * * *'
-  workflow_dispatch:
+    # 06:30 Uhr deutsche Sommerzeit (04:30 UTC)
+    - cron: '30 4 * * *'
+    # 12:00 Uhr deutsche Sommerzeit (10:00 UTC)
+    - cron: '0 10 * * *'
+    # 16:00 Uhr deutsche Sommerzeit (14:00 UTC)
+    - cron: '0 14 * * *'
+    # 20:00 Uhr deutsche Sommerzeit (18:00 UTC)
+    - cron: '0 18 * * *'
 
 jobs:
-  run-tracker:
+  track:
     runs-on: ubuntu-latest
+    timeout-minutes: 90  # Großzügiges Limit für über 200 Hotels
+    
     steps:
-      - name: Checkout Code
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install System Dependencies (Xvfb)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-
-      - name: Install Python Dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install playwright requests openpyxl
-
-      - name: Install Playwright Browsers & Deps
-        run: |
+          pip install requests playwright openpyxl
           playwright install --with-deps chromium
 
       - name: Run Tracker
         env:
+          # Hier holt sich GitHub deine geheimen Daten aus dem Tresor
           SHEET_ID: ${{ secrets.SHEET_ID }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
         run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python tracker.py
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python tracker.py --show
