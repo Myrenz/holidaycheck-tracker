@@ -17,6 +17,7 @@ from pathlib import Path
 import requests
 
 # ----------------------------- KONFIGURATION ---------------------------------
+# Die Werte kommen sicher aus den GitHub Secrets! Keine Klartext-Links eintragen!
 SHEET_ID = os.getenv("SHEET_ID")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
@@ -24,13 +25,12 @@ BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "msedge")
 API_HINT = os.getenv("API_HINT", "all-offers-service")
 
 # EXAKTE SUCHPARAMETER (Aus dem HolidayCheck-Link)
-# Passe diese Daten hier zentral an, wenn sich euer Reisezeitraum ändert!
 SEARCH_QUERY = "?_offer=airport:~FMO~BRE,departureDate:2027-06-14,returnDate:2027-06-28,duration:7,adults:2"
 # -----------------------------------------------------------------------------
 
 MIN_OK, MAX_OK = 1000, 20000       # Filter: Ignoriert Preise unter 1000 €
-PAUSE_HOTEL = (2, 4)               # Extreme-Turbo: Nur noch 2-4 Sekunden Pause
-PAUSE_BLOCK = (5, 10)              # Extreme-Turbo: Kürzere Pause nach je 25 Hotels
+PAUSE_HOTEL = (2, 4)               
+PAUSE_BLOCK = (5, 10)              
 MAX_CONSECUTIVE_FAILS = 15         
 WAIT_FOR_API_S = 40
 
@@ -64,7 +64,6 @@ def load_hotels(xlsx: str | None) -> list[tuple[str, str]]:
         active = str(x.get("active", "true")).strip().lower() in ("true", "1", "ja", "yes", "wahr")
         
         if name and url.startswith("http") and active:
-            # Hängen Suchkriterien zwingend an, falls sie fehlen
             if "?" not in url:
                 url = url + SEARCH_QUERY
             hotels.append((name, url))
