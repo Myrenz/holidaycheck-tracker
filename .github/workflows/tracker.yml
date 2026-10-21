@@ -31,11 +31,10 @@ jobs:
         run: |
           playwright install --with-deps chromium
 
-      - name: Run Tracker via Virtual Framebuffer (Xvfb)
+      - name: Run Tracker
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
-          BROWSER_CHANNEL: "chromium"
         run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python tracker.py --show
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python tracker.py
