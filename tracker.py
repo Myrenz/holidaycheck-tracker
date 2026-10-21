@@ -17,9 +17,9 @@ from pathlib import Path
 import requests
 
 # ----------------------------- KONFIGURATION ---------------------------------
-SHEET_ID = os.getenv("SHEET_ID", "1MG0UwMZbmFoSxCdVp8pqspM5wgtgQlJGyoVesRXd5ag")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://script.google.com/macros/s/AKfycbx2Ed3LMH0NOQY9qawf3UC3-Kp2uZbaSKSu4RvTR54dLGvHEtFIGMP1NVzy3ifGMMaUWA/exec")
-WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "123456789")
+SHEET_ID = os.getenv("SHEET_ID")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "msedge")
 API_HINT = os.getenv("API_HINT", "all-offers-service")
 
