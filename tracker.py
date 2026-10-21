@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Stealth/Xvfb)
-Inklusive präziser Bewertungs-Auslese via DOM-Selektor und zielgenauem Gesamtpreis-Parser.
+Inklusive Suchparameter-Injektion für exakte Reisedaten!
 """
 import argparse
 import csv
 import io
-import json
 import os
 import random
 import re
@@ -23,12 +22,16 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://script.google.com/macros/s/AKfyc
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "123456789")
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "msedge")
 API_HINT = os.getenv("API_HINT", "all-offers-service")
+
+# EXAKTE SUCHPARAMETER (Aus dem HolidayCheck-Link)
+# Passe diese Daten hier zentral an, wenn sich euer Reisezeitraum ändert!
+SEARCH_QUERY = "?_offer=airport:~FMO~BRE,departureDate:2027-06-14,returnDate:2027-06-28,duration:7,adults:2"
 # -----------------------------------------------------------------------------
 
 MIN_OK, MAX_OK = 1000, 20000       # Filter: Ignoriert Preise unter 1000 €
-PAUSE_HOTEL = (2, 4)               # Extreme-Turbo: Nur noch 2-4 Sekunden Pause zwischen den Hotels
+PAUSE_HOTEL = (2, 4)               # Extreme-Turbo: Nur noch 2-4 Sekunden Pause
 PAUSE_BLOCK = (5, 10)              # Extreme-Turbo: Kürzere Pause nach je 25 Hotels
-MAX_CONSECUTIVE_FAILS = 15         # Extreme-Turbo: Bricht erst nach 15 blockierten Hotels in Folge ab
+MAX_CONSECUTIVE_FAILS = 15         
 WAIT_FOR_API_S = 40
 
 BASE = Path(__file__).resolve().parent
@@ -59,40 +62,31 @@ def load_hotels(xlsx: str | None) -> list[tuple[str, str]]:
         name = str(x.get("name") or "").strip()
         url = str(x.get("url") or "").strip()
         active = str(x.get("active", "true")).strip().lower() in ("true", "1", "ja", "yes", "wahr")
+        
         if name and url.startswith("http") and active:
+            # HIER PASSIERT DIE MAGIE: Wir hängen die Suchkriterien zwingend an den nackten Link an!
+            if "?" not in url:
+                url = url + SEARCH_QUERY
             hotels.append((name, url))
     return hotels
 
 # ------------------------------ Preis-Parser ---------------------------------
 def to_number(v):
-    if isinstance(v, bool):
-        return None
-    if isinstance(v, (int, float)):
-        return float(v)
+    if isinstance(v, bool): return None
+    if isinstance(v, (int, float)): return float(v)
     if isinstance(v, str):
         s = v.replace("€", "").replace("EUR", "").strip()
-        if "," in s:
-            s = s.replace(".", "").replace(",", ".")
-        try:
-            return float(s)
-        except ValueError:
-            return None
+        if "," in s: s = s.replace(".", "").replace(",", ".")
+        try: return float(s)
+        except ValueError: return None
     return None
 
 def extract_price(payloads: list) -> tuple[float | None, str]:
-    """
-    Extrahiert GEZIELT den Gesamtpreis des ersten (besten) Angebots.
-    Ignoriert "pro Person" Preise oder Teil-Angebote komplett.
-    """
     for data in payloads:
-        # Wir suchen das Array mit den gebündelten Angeboten
         offers = data.get("data", {}).get("offers", [])
-        
         if isinstance(offers, list) and len(offers) > 0:
-            # Wir nehmen exakt das erste Angebot (das Top-Angebot auf der Webseite)
             first_offer = offers[0]
             
-            # Wir zielen DIREKT auf den 'totalPrice' (Gesamtpreis für alle Reisenden)
             tp = first_offer.get("totalPrice", {})
             if isinstance(tp, dict):
                 val = to_number(tp.get("amount") or tp.get("value"))
@@ -102,13 +96,11 @@ def extract_price(payloads: list) -> tuple[float | None, str]:
                 if MIN_OK <= float(tp) <= MAX_OK:
                     return float(tp), "api=totalPrice(raw)"
                     
-            # Fallback, falls das Feld im System nur 'price' heißt
             p = first_offer.get("price", {})
             if isinstance(p, dict):
                 val = to_number(p.get("amount") or p.get("value"))
                 if val is not None and MIN_OK <= val <= MAX_OK:
                     return val, "api=price"
-                    
     return None, ""
 
 # ------------------------------ Browser --------------------------------------
@@ -149,13 +141,10 @@ def fetch_offers(ctx, url: str, probe: bool = False):
 
     def on_response(resp):
         try:
-            if resp.request.resource_type not in ("xhr", "fetch"):
-                return
+            if resp.request.resource_type not in ("xhr", "fetch"): return
             ctype = (resp.headers.get("content-type") or "").lower()
-            if "json" in ctype:
-                seen.append((resp.status, resp.url))
-            if API_HINT in resp.url and resp.status == 200:
-                hits.append(resp)
+            if "json" in ctype: seen.append((resp.status, resp.url))
+            if API_HINT in resp.url and resp.status == 200: hits.append(resp)
         except Exception:
             pass
 
@@ -163,47 +152,36 @@ def fetch_offers(ctx, url: str, probe: bool = False):
     blocked = False
     try:
         main = page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        if main is not None and main.status in (403, 429):
-            blocked = True
+        if main is not None and main.status in (403, 429): blocked = True
         t0 = time.time()
         while time.time() - t0 < WAIT_FOR_API_S and not hits:
             page.wait_for_timeout(500)
-        if hits:
-            page.wait_for_timeout(2000)
+        if hits: page.wait_for_timeout(2000)
         if not hits and re.search(r"access denied|zugriff verweigert", page.title() or "", re.I):
             blocked = True
             
         payloads = []
         for r in hits:
-            try:
-                payloads.append(r.json())
-            except Exception:
-                pass
+            try: payloads.append(r.json())
+            except Exception: pass
                 
-        # --- 100% PRÄZISE AUSLESE DIREKT AUS DEM REVIEW-BADGE ---
         rating, rec, count = "", "", ""
         try:
             rating, rec, count = page.evaluate(r"""() => {
                 let ratingText = "", recText = "", countText = "";
                 const reviewBar = document.querySelector('[data-trackid="hotel-review-bar"]') || document.querySelector('.HotelReviewBar');
-                
                 if (reviewBar) {
                     const text = reviewBar.innerText;
-                    
                     const recMatch = text.match(/(\d{2,3})\s*%/);
                     if (recMatch) recText = recMatch[1];
-                    
                     const sunMatch = text.match(/([0-9][.,][0-9])\s*\/\s*6/);
                     if (sunMatch) ratingText = sunMatch[1].replace(',', '.');
-                    
                     const countMatch = text.match(/([\d.]+)\s*Bewertungen/i);
                     if (countMatch) countText = countMatch[1].replace(/\./g, '');
                 }
-                
                 return [ratingText, recText, countText];
             }""")
-        except Exception:
-            pass
+        except Exception: pass
             
         return payloads, blocked, seen, rating, rec, count
     finally:
@@ -216,29 +194,26 @@ def mode_setup():
         ctx = open_context(p, show=True)
         page = ctx.new_page()
         page.goto("https://www.holidaycheck.de/", timeout=60_000)
-        input("Cookie-Banner bestätigen, ggf. kurz auf der Seite umsehen. Dann hier ENTER drücken ... ")
+        input("Cookie-Banner bestätigen. Dann hier ENTER drücken ... ")
         ctx.close()
-    print("Profil gespeichert.")
 
 def mode_probe(hotels, show: bool):
     from playwright.sync_api import sync_playwright
     name, url = hotels[0]
     print(f"PROBE mit: {name}\n{url}\n")
-    DEBUG_DIR.mkdir(exist_ok=True)
     with sync_playwright() as p:
         ctx = open_context(p, show)
         payloads, blocked, seen, rating, rec, count = fetch_offers(ctx, url, probe=True)
         ctx.close()
     print(f"Blockiert: {blocked}")
-    print(f"Bewertung gefunden: {rating} / 6 | Empfehlung: {rec}% | Anzahl: {count}")
+    print(f"Bewertung: {rating} / 6 | {rec}% | {count} Reviews")
 
 def post_rows(rows: list) -> bool:
     for i in range(1, 4):
         try:
             r = requests.post(WEBHOOK_URL, json={"token": WEBHOOK_TOKEN, "rows": rows}, timeout=120)
             if r.ok and r.text.strip().startswith("ok"): return True
-        except requests.RequestException:
-            pass
+        except requests.RequestException: pass
         time.sleep(5 * i)
     return False
 
@@ -262,8 +237,7 @@ def mode_run(hotels, show: bool) -> int:
                         if rating: extra_parts.append(f"rating={rating}")
                         if rec: extra_parts.append(f"rec={rec}")
                         if count: extra_parts.append(f"count={count}")
-                        if extra_parts:
-                            details = f"{details}|{'|'.join(extra_parts)}"
+                        if extra_parts: details = f"{details}|{'|'.join(extra_parts)}"
                         break
                 except Exception as e:
                     details = f"fehler={type(e).__name__}"
@@ -272,24 +246,18 @@ def mode_run(hotels, show: bool) -> int:
             if price is not None:
                 rows.append([ts, name, price, details])
                 consecutive = 0
-                print(f"{price:.0f} EUR")
+                print(f"{price:.2f} EUR")
             else:
                 consecutive += 1
                 (failed if blocked or details else no_offer).append(name)
                 print("BLOCKIERT" if blocked else "kein Preis")
-                if consecutive >= MAX_CONSECUTIVE_FAILS:
-                    break
+                if consecutive >= MAX_CONSECUTIVE_FAILS: break
 
             time.sleep(random.uniform(*PAUSE_HOTEL))
             if i % 25 == 0: time.sleep(random.uniform(*PAUSE_BLOCK))
         ctx.close()
 
     if rows:
-        new = not BACKUP_CSV.exists()
-        with BACKUP_CSV.open("a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            if new: w.writerow(["Zeitstempel", "Hotel", "Günstigster_Preis_EUR", "Details"])
-            w.writerows(rows)
         post_rows(rows)
     return 0 if rows else 1
 
@@ -299,11 +267,10 @@ def main() -> int:
     ap.add_argument("--probe", action="store_true")
     ap.add_argument("--show", action="store_true")
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--xlsx", default=None)
-    args = ap.parse_args()
+    args, _ = ap.parse_known_args()
 
     if args.setup: return mode_setup() or 0
-    hotels = load_hotels(args.xlsx)
+    hotels = load_hotels(None)
     if args.limit: hotels = hotels[: args.limit]
     if not hotels: return 1
     if args.probe: return mode_probe(hotels, args.show) or 0
