@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Stealth/Xvfb)
-Inklusive präziser Bewertungs-Auslese via DOM-Selektor (ohne Werbebanner-Fehler).
+Inklusive präziser Bewertungs-Auslese via DOM-Selektor und zielgenauem Gesamtpreis-Parser.
 """
 import argparse
 import csv
@@ -12,7 +12,6 @@ import random
 import re
 import sys
 import time
-from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -24,7 +23,6 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://script.google.com/macros/s/AKfyc
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "123456789")
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "msedge")
 API_HINT = os.getenv("API_HINT", "all-offers-service")
-PRICE_KEYS = [k.strip().lower() for k in os.getenv("PRICE_KEYS", "amount,totalprice,price").split(",")]
 # -----------------------------------------------------------------------------
 
 MIN_OK, MAX_OK = 1000, 20000       # Filter: Ignoriert Preise unter 1000 €
@@ -66,19 +64,6 @@ def load_hotels(xlsx: str | None) -> list[tuple[str, str]]:
     return hotels
 
 # ------------------------------ Preis-Parser ---------------------------------
-def walk(obj, path=""):
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            yield from walk(v, f"{path}.{k}")
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj):
-            yield from walk(v, f"{path}[{i}]")
-    else:
-        yield path, obj
-
-def last_key(path: str) -> str:
-    return re.sub(r"\[\d+\]$", "", path.rsplit(".", 1)[-1]).lower()
-
 def to_number(v):
     if isinstance(v, bool):
         return None
@@ -95,28 +80,35 @@ def to_number(v):
     return None
 
 def extract_price(payloads: list) -> tuple[float | None, str]:
-    found = []
+    """
+    Extrahiert GEZIELT den Gesamtpreis des ersten (besten) Angebots.
+    Ignoriert "pro Person" Preise oder Teil-Angebote komplett.
+    """
     for data in payloads:
+        # Wir suchen das Array mit den gebündelten Angeboten
         offers = data.get("data", {}).get("offers", [])
-        if not isinstance(offers, list):
-            for path, v in walk(data):
-                k = last_key(path)
-                if k in ("totalprice", "price") and isinstance(v, (int, float)):
-                    if MIN_OK <= v <= MAX_OK:
-                        found.append(float(v))
-        else:
-            for offer in offers:
-                tp = offer.get("totalPrice", {})
-                if isinstance(tp, dict):
-                    val = to_number(tp.get("amount"))
-                    if val is not None and MIN_OK <= val <= MAX_OK:
-                        found.append(val)
-                elif isinstance(tp, (int, float)):
-                    if MIN_OK <= tp <= MAX_OK:
-                        found.append(float(tp))
-                        
-    if found:
-        return min(found), f"feld=totalPrice;n={len(found)}"
+        
+        if isinstance(offers, list) and len(offers) > 0:
+            # Wir nehmen exakt das erste Angebot (das Top-Angebot auf der Webseite)
+            first_offer = offers[0]
+            
+            # Wir zielen DIREKT auf den 'totalPrice' (Gesamtpreis für alle Reisenden)
+            tp = first_offer.get("totalPrice", {})
+            if isinstance(tp, dict):
+                val = to_number(tp.get("amount") or tp.get("value"))
+                if val is not None and MIN_OK <= val <= MAX_OK:
+                    return val, "api=totalPrice"
+            elif isinstance(tp, (int, float)):
+                if MIN_OK <= float(tp) <= MAX_OK:
+                    return float(tp), "api=totalPrice(raw)"
+                    
+            # Fallback, falls das Feld im System nur 'price' heißt
+            p = first_offer.get("price", {})
+            if isinstance(p, dict):
+                val = to_number(p.get("amount") or p.get("value"))
+                if val is not None and MIN_OK <= val <= MAX_OK:
+                    return val, "api=price"
+                    
     return None, ""
 
 # ------------------------------ Browser --------------------------------------
@@ -193,22 +185,17 @@ def fetch_offers(ctx, url: str, probe: bool = False):
         try:
             rating, rec, count = page.evaluate(r"""() => {
                 let ratingText = "", recText = "", countText = "";
-                
-                // Exakt das Element anvisieren
                 const reviewBar = document.querySelector('[data-trackid="hotel-review-bar"]') || document.querySelector('.HotelReviewBar');
                 
                 if (reviewBar) {
                     const text = reviewBar.innerText;
                     
-                    // Weiterempfehlung (z.B. "95%")
                     const recMatch = text.match(/(\d{2,3})\s*%/);
                     if (recMatch) recText = recMatch[1];
                     
-                    // Sonnen (z.B. "5,5 / 6")
                     const sunMatch = text.match(/([0-9][.,][0-9])\s*\/\s*6/);
                     if (sunMatch) ratingText = sunMatch[1].replace(',', '.');
                     
-                    // Anzahl Bewertungen (z.B. "5.832 Bewertungen")
                     const countMatch = text.match(/([\d.]+)\s*Bewertungen/i);
                     if (countMatch) countText = countMatch[1].replace(/\./g, '');
                 }
