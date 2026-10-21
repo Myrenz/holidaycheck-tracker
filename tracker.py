@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Stealth/Xvfb)
-Inklusive Suchparameter-Injektion für exakte Reisedaten!
+Inklusive Suchparameter-Injektion für exakte Reisedaten und Zeitzonen-Korrektur!
 """
 import argparse
 import csv
@@ -11,7 +11,7 @@ import random
 import re
 import sys
 import time
-from datetime import datetime
+import datetime as dt
 from pathlib import Path
 
 import requests
@@ -64,7 +64,7 @@ def load_hotels(xlsx: str | None) -> list[tuple[str, str]]:
         active = str(x.get("active", "true")).strip().lower() in ("true", "1", "ja", "yes", "wahr")
         
         if name and url.startswith("http") and active:
-            # HIER PASSIERT DIE MAGIE: Wir hängen die Suchkriterien zwingend an den nackten Link an!
+            # Hängen Suchkriterien zwingend an, falls sie fehlen
             if "?" not in url:
                 url = url + SEARCH_QUERY
             hotels.append((name, url))
@@ -219,7 +219,10 @@ def post_rows(rows: list) -> bool:
 
 def mode_run(hotels, show: bool) -> int:
     from playwright.sync_api import sync_playwright
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    
+    # --- ZEITZONEN-KORREKTUR FÜR GITHUB ACTIONS (Deutsche Zeit MESZ) ---
+    ts = dt.datetime.now(dt.timezone(dt.timedelta(hours=2))).strftime("%Y-%m-%d %H:%M")
+    
     rows, no_offer, failed = [], [], []
     consecutive = 0
 
