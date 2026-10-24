@@ -2,15 +2,11 @@
 """
 HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Stealth/Xvfb)
 
-Änderungen gegenüber der Vorversion:
-- Zeitstempel in deutscher Zeit MIT Sommer-/Winterzeit (vorher fest +2 h, ab 25.10.2026 falsch)
-- Status-Zeilen für Hotels ohne Preis (status=no_offer|blocked|no_response|unparsed|error:...),
-  damit "ausverkauft" von "Scraper-Problem" unterscheidbar ist
-- Zeilen werden sofort in ein lokales Backup geschrieben und alle 25 Hotels gebündelt gesendet
-  (Webhook ist idempotent, Wiederholungen erzeugen keine Duplikate)
-- 'no_offer' (Hotel real ausverkauft) zählt nicht mehr als Fehler für den Abbruch nach N Fehlschlägen
-- Exit-Codes: 0 ok, 1 keine Preise, 2 Webhook-Versand fehlgeschlagen, 3 Lauf abgebrochen
-- --probe speichert die rohen API-Antworten in debug/probe_payloads.json
+Funktionen:
+- Liest aktuelle Pauschalreise-Preise (2 Erw., 7 Tage, FMO/BRE, Juni 2027) über die interne HC-API aus.
+- NEU (1-Link-Autopilot): Füllt fehlende Stammdaten im Reiter 'hotels' (Bild-URL, Name, ID, Region,
+  Ortsteil, Sterne, Tags, Active-Status) automatisch über den Webhook auf.
+  Für neue Hotels reicht es, nur den HolidayCheck-Link in Spalte H (url) einzutragen!
 """
 import argparse
 import csv
@@ -22,35 +18,182 @@ import random
 import re
 import sys
 import time
+import uuid
 from collections import defaultdict
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
 # ----------------------------- KONFIGURATION ---------------------------------
-# Die Werte kommen sicher aus den GitHub Secrets! Keine Klartext-Links eintragen!
-SHEET_ID = os.getenv("SHEET_ID")
+SHEET_ID = os.getenv("SHEET_ID") or "1MG0UwMZbmFoSxCdVp8pqspM5wgtgQlJGyoVesRXd5ag"
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "msedge")
 API_HINT = os.getenv("API_HINT", "all-offers-service")
 
-# EXAKTE SUCHPARAMETER (Aus dem HolidayCheck-Link)
+# EXAKTE SUCHPARAMETER
 SEARCH_QUERY = "?_offer=airport:~FMO~BRE,departureDate:2027-06-14,returnDate:2027-06-28,duration:7,adults:2"
 # -----------------------------------------------------------------------------
 
-MIN_OK, MAX_OK = 1000, 20000       # Filter: Ignoriert Preise unter 1000 €
+MIN_OK, MAX_OK = 1000, 20000
 PAUSE_HOTEL = (2, 4)
 PAUSE_BLOCK = (5, 10)
-MAX_CONSECUTIVE_FAILS = 15         # nur echte Fehler (blocked / no_response / unparsed / error)
+MAX_CONSECUTIVE_FAILS = 15
 WAIT_FOR_API_S = 40
-FLUSH_EVERY = 25                   # Hotels pro Webhook-Sendung
-POST_CHUNK = 100                   # Zeilen pro HTTP-Request
+FLUSH_EVERY = 25
+POST_CHUNK = 100
 
 BASE = Path(__file__).resolve().parent
 PROFILE_DIR = BASE / "browser_profile"
 DEBUG_DIR = BASE / "debug"
 BACKUP_CSV = BASE / "preishistorie_backup.csv"
+
+UUID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
+
+# ------------------------- Standort-Klassifizierung --------------------------
+SUB_LOCATIONS = [
+    (r"\bokurcalar\b", "Alanya", "Okurcalar"),
+    (r"\b(incekum|i̇ncekum)\b", "Alanya", "İncekum"),
+    (r"\bavsallar\b", "Alanya", "Avsallar"),
+    (r"\b(türkler|turkler|türklek|fugla)\b", "Alanya", "Türkler"),
+    (r"\b(konaklı|konakli)\b", "Alanya", "Konaklı"),
+    (r"\bpayallar\b", "Alanya", "Payallar"),
+    (r"\b(kargıcak|kargicak)\b", "Alanya", "Kargıcak"),
+    (r"\bmahmutlar\b", "Alanya", "Mahmutlar"),
+    (r"\bkestel\b", "Alanya", "Kestel"),
+    (r"\btosmur\b", "Alanya", "Tosmur"),
+    (r"\b(obagöl|obagol|oba\b|cikcilli)\b", "Alanya", "Oba"),
+    (r"\b(kleopatra|cleopatra|damlataş|damlatas|kızlarpınarı|kizlarpinari)\b", "Alanya", "Kleopatra-Strand"),
+    (r"\b(kumköy|kumkoy|kumkoey|ılıca|ilica)\b", "Side", "Kumköy"),
+    (r"\bevrenseki\b", "Side", "Evrenseki"),
+    (r"\b(çolaklı|colakli)\b", "Side", "Çolaklı"),
+    (r"\b(gündoğdu|gundogdu)\b", "Side", "Gündoğdu"),
+    (r"\bsorgun\b", "Side", "Sorgun"),
+    (r"\b(titreyengöl|titreyengol)\b", "Side", "Titreyengöl"),
+    (r"\b(kızılağaç|kizilagac)\b", "Side", "Kızılağaç"),
+    (r"\b(kızılot|kizilot)\b", "Side", "Kızılot"),
+    (r"\b(çenger|cenger)\b", "Side", "Çenger"),
+    (r"\b(boğazkent|bogazkent)\b", "Belek", "Boğazkent"),
+    (r"\bkadriye\b", "Belek", "Kadriye"),
+    (r"\bbeldibi\b", "Kemer", "Beldibi"),
+    (r"\b(göynük|goynuk|goynük)\b", "Kemer", "Göynük"),
+    (r"\b(kiriş|kiris)\b", "Kemer", "Kiriş"),
+    (r"\b(çamyuva|camyuva)\b", "Kemer", "Çamyuva"),
+    (r"\btekirova\b", "Kemer", "Tekirova"),
+    (r"\bkundu\b", "Antalya", "Lara / Kundu"),
+    (r"\b(lara|kemerağzı|kemeragzi|güzeloba|guzeloba)\b", "Antalya", "Lara"),
+    (r"\b(konyaaltı|konyaalti)\b", "Antalya", "Konyaaltı"),
+]
+
+
+def _find_sublocation(text: str, allowed_region: str | None = None):
+    if not text:
+        return None
+    best_match, best_pos = None, 10**9
+    for pattern, reg, sub_ort in SUB_LOCATIONS:
+        if allowed_region and reg != allowed_region:
+            continue
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m and m.start() < best_pos:
+            best_pos = m.start()
+            best_match = (reg, sub_ort)
+    return best_match
+
+
+def _detect_main_region(text: str) -> str | None:
+    if not text:
+        return None
+    t = text.lower()
+    sub = _find_sublocation(t)
+    if sub:
+        return sub[0]
+    patterns = [
+        (r"\balanya\b", "Alanya"),
+        (r"\b(belek|serik)\b", "Belek"),
+        (r"\bkemer\b", "Kemer"),
+        (r"\b(side|manavgat)\b", "Side"),
+        (r"\b(aksu|muratpaşa|muratpasa|lara|kundu|konyaaltı|konyaalti)\b", "Antalya"),
+    ]
+    best_reg, best_pos = None, 10**9
+    for pat, reg in patterns:
+        m = re.search(pat, t)
+        if m and m.start() < best_pos:
+            best_pos = m.start()
+            best_reg = reg
+    return best_reg
+
+
+def classify_location(hotel_name: str, breadcrumbs: str, address_line: str, body_text: str) -> tuple[str, str]:
+    name_low = (hotel_name or "").lower()
+    bread_low = (breadcrumbs or "").lower()
+    addr_low = (address_line or "").lower()
+    clean_body = re.sub(r"[^\n]*flughafen[^\n]*", "", body_text or "", flags=re.IGNORECASE)
+
+    locked_region = _detect_main_region(name_low)
+    if not locked_region and "antalya" in name_low:
+        locked_region = "Antalya"
+
+    zip_m = re.search(r"\b(07\d{3})\b", addr_low)
+    if zip_m and not locked_region:
+        z = int(zip_m.group(1))
+        if 7400 <= z <= 7499:
+            locked_region = "Alanya"
+        elif 7600 <= z <= 7699:
+            locked_region = "Side"
+        elif 7500 <= z <= 7599:
+            locked_region = "Belek"
+        elif 7980 <= z <= 7999:
+            locked_region = "Kemer"
+        elif 7000 <= z <= 7299:
+            locked_region = "Antalya"
+
+    if not locked_region:
+        locked_region = _detect_main_region(bread_low) or _detect_main_region(addr_low) or _detect_main_region(clean_body[:1500])
+    if not locked_region:
+        locked_region = "Antalya" if "antalya" in addr_low else "Side"
+
+    for src in (name_low, bread_low, addr_low, clean_body[:1500].lower()):
+        sub = _find_sublocation(src, allowed_region=locked_region)
+        if sub:
+            return locked_region, sub[1]
+
+    return locked_region, ""
+
+
+def extract_tags_from_text(text: str) -> str:
+    low = (text or "").lower()
+    tags = []
+    if "direkt am strand" in low or "direkter strand" in low or "eigenem strand" in low:
+        tags.append("Direkt am Strand")
+    elif "strand" in low:
+        tags.append("Strandnah")
+    if "aquapark" in low or "wasserrutsch" in low:
+        tags.append("Aquapark")
+    if "swim-up" in low or "swim up" in low:
+        tags.append("Swim-Up Option")
+    if "adults only" in low or "erwachsenenhotel" in low or "ab 16" in low or "ab 18" in low:
+        tags.append("Adults Only")
+    elif "kinderclub" in low or "miniclub" in low or "familien" in low:
+        tags.append("Familienhotel")
+    if "ultra all inclusive" in low or "24 stunden" in low or "24h" in low:
+        tags.append("All Inclusive Plus / 24h")
+    if "wlan" in low or "wi-fi" in low:
+        tags.append("WLAN kostenfrei")
+    return ", ".join(tags[:5]) if tags else "All Inclusive, Strandnah"
+
+
+def fallback_name_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    parts = [p for p in parsed.path.split("/") if p]
+    for p in parts:
+        if p.startswith("angebote-"):
+            slug = p[len("angebote-"):]
+            return " ".join(w.capitalize() for w in slug.split("-") if w)
+    if len(parts) >= 2 and parts[0].lower() == "hi":
+        slug = re.sub(r"-hotel$", "", parts[1], flags=re.I)
+        return " ".join(w.capitalize() for w in slug.split("-") if w)
+    return "Neues Hotel"
 
 
 def require_env(*names: str) -> None:
@@ -61,13 +204,11 @@ def require_env(*names: str) -> None:
 
 # ------------------------------ Zeit -----------------------------------------
 def _last_sunday(year: int, month: int) -> dt.date:
-    d = dt.date(year, month, 31)               # März und Oktober haben 31 Tage
+    d = dt.date(year, month, 31)
     return d - dt.timedelta(days=(d.weekday() + 1) % 7)
 
 
 def berlin_now(now_utc: dt.datetime | None = None) -> dt.datetime:
-    """Aktuelle deutsche Zeit. Sommerzeit gilt von letztem So im März 01:00 UTC
-    bis letztem So im Oktober 01:00 UTC. Ohne zoneinfo/tzdata (läuft auch unter Windows)."""
     utc = now_utc or dt.datetime.now(dt.timezone.utc)
     start = dt.datetime.combine(_last_sunday(utc.year, 3), dt.time(1, 0), tzinfo=dt.timezone.utc)
     end = dt.datetime.combine(_last_sunday(utc.year, 10), dt.time(1, 0), tzinfo=dt.timezone.utc)
@@ -76,7 +217,7 @@ def berlin_now(now_utc: dt.datetime | None = None) -> dt.datetime:
 
 
 # ------------------------------ Hotelliste -----------------------------------
-def load_hotels(xlsx: str | None) -> list[tuple[str, str]]:
+def load_hotels(xlsx: str | None) -> list[dict]:
     if xlsx:
         import openpyxl
         ws = openpyxl.load_workbook(xlsx, read_only=True, data_only=True)["hotels"]
@@ -84,7 +225,6 @@ def load_hotels(xlsx: str | None) -> list[tuple[str, str]]:
         head = [str(c).strip().lower() for c in rows[0]]
         recs = [dict(zip(head, r)) for r in rows[1:]]
     else:
-        require_env("SHEET_ID")
         r = requests.get(
             f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq",
             params={"tqx": "out:csv", "sheet": "hotels", "headers": 1},
@@ -96,14 +236,53 @@ def load_hotels(xlsx: str | None) -> list[tuple[str, str]]:
 
     hotels = []
     for x in recs:
-        name = str(x.get("name") or "").strip()
-        url = str(x.get("url") or "").strip()
-        active = str(x.get("active", "true")).strip().lower() in ("true", "1", "ja", "yes", "wahr")
+        raw_url = str(x.get("url") or "").strip()
+        if not raw_url.startswith("http"):
+            continue
 
-        if name and url.startswith("http") and active:
-            if "?" not in url:
-                url = url + SEARCH_QUERY
-            hotels.append((name, url))
+        active_raw = str(x.get("active") or "").strip().lower()
+        # Nur überspringen, wenn explizit auf FALSE/0/NEIN gesetzt (leere Zelle bei neuen Hotels wird automatisch aktiviert!)
+        if active_raw in ("false", "0", "nein", "no", "falsch"):
+            continue
+
+        row_id = str(x.get("id") or "").strip()
+        name = str(x.get("name") or "").strip()
+        region = str(x.get("region") or "").strip()
+        ort = str(x.get("ort") or "").strip()
+        stars = str(x.get("stars") or "").strip()
+        tags = str(x.get("tags") or "").strip()
+        image = str(x.get("image") or "").strip()
+
+        # Saubere Angebots-URL mit den festen Reise-Parametern bauen
+        base_url = raw_url.split("?")[0].rstrip("/")
+        scrape_url = base_url + SEARCH_QUERY
+
+        # UUID aus dem HolidayCheck-Link ziehen (für ID & automatisches Vorschaubild)
+        m_uuid = UUID_RE.search(base_url)
+        hc_uuid = m_uuid.group(1).lower() if m_uuid else ""
+
+        auto_update = {}
+        if not row_id:
+            auto_update["id"] = hc_uuid or str(uuid.uuid4())
+        if not active_raw:
+            auto_update["active"] = "TRUE"
+        if not image and hc_uuid:
+            auto_update["image"] = f"https://www.holidaycheck.de/main-photo-redirect/{hc_uuid}/w_640,h_480,c_fill,q_auto,f_auto"
+
+        need_page_meta = not (name and region and stars and tags)
+
+        hotels.append({
+            "name": name or fallback_name_from_url(base_url),
+            "has_name": bool(name),
+            "has_region": bool(region),
+            "has_ort": bool(ort),
+            "has_stars": bool(stars),
+            "has_tags": bool(tags),
+            "raw_url": raw_url,
+            "scrape_url": scrape_url,
+            "auto_update": auto_update,
+            "need_page_meta": need_page_meta,
+        })
     return hotels
 
 
@@ -117,7 +296,7 @@ def to_number(v):
         s = v.replace("€", "").replace("EUR", "").strip()
         if "," in s:
             s = s.replace(".", "").replace(",", ".")
-        elif re.fullmatch(r"\d{1,3}(\.\d{3})+", s):   # "1.899" = 1899, nicht 1,899
+        elif re.fullmatch(r"\d{1,3}(\.\d{3})+", s):
             s = s.replace(".", "")
         try:
             return float(s)
@@ -152,12 +331,6 @@ def extract_price(payloads: list) -> tuple[float | None, str]:
 
 
 def classify_failure(payloads: list, blocked: bool) -> str:
-    """Warum gibt es keinen Preis?
-    blocked      Seite hat 403/429 oder 'Access denied' geliefert
-    no_response  keine API-Antwort innerhalb des Zeitfensters (Timeout, Challenge, Netzwerk)
-    no_offer     API antwortet, aber mit leerer Angebotsliste => Hotel real nicht buchbar
-    unparsed     API liefert Angebote, aber Preis nicht lesbar => HolidayCheck hat das Format geändert
-    """
     if blocked:
         return "blocked"
     if not payloads:
@@ -207,7 +380,7 @@ def open_context(p, show: bool):
     return ctx
 
 
-def fetch_offers(ctx, url: str, probe: bool = False):
+def fetch_offers(ctx, url: str, need_meta: bool = False):
     page = ctx.new_page()
     hits, seen = [], []
 
@@ -232,6 +405,7 @@ def fetch_offers(ctx, url: str, probe: bool = False):
 
     page.on("response", on_response)
     blocked = False
+    meta = {}
     try:
         main = page.goto(url, wait_until="domcontentloaded", timeout=60_000)
         if main is not None and main.status in (403, 429):
@@ -270,7 +444,63 @@ def fetch_offers(ctx, url: str, probe: bool = False):
         except Exception:
             pass
 
-        return payloads, blocked, seen, rating, rec, count
+        # Falls es ein neues Hotel ist, bei dem Name/Region/Sterne/Tags noch in Sheets fehlen:
+        if need_meta and not blocked:
+            try:
+                raw_meta = page.evaluate(r"""() => {
+                    const h1 = document.querySelector('h1') ? document.querySelector('h1').innerText.trim() : '';
+                    const fullText = document.body ? document.body.innerText : '';
+                    let addressLine = '';
+                    const mapIdx = fullText.indexOf('Auf Karte anzeigen');
+                    if (mapIdx !== -1) {
+                        const chunk = fullText.substring(Math.max(0, mapIdx - 250), mapIdx).trim();
+                        const lines = chunk.split('\n').map(l => l.trim()).filter(Boolean);
+                        if (lines.length > 0) addressLine = lines[lines.length - 1];
+                    }
+                    let breadcrumbs = '';
+                    document.querySelectorAll('nav, [aria-label*="readcrumb"], [class*="breadcrumb"]').forEach(el => {
+                        breadcrumbs += ' ' + el.innerText;
+                    });
+                    let stars = '';
+                    let ogImage = '';
+                    const ogEl = document.querySelector('meta[property="og:image"]');
+                    if (ogEl) ogImage = ogEl.getAttribute('content') || '';
+                    document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
+                        try {
+                            const data = JSON.parse(s.innerText);
+                            const items = Array.isArray(data) ? data : [data];
+                            items.forEach(item => {
+                                if (item.starRating && item.starRating.ratingValue) stars = String(item.starRating.ratingValue);
+                                if (item.address) addressLine += ' ' + JSON.stringify(item.address);
+                            });
+                        } catch(e) {}
+                    });
+                    return { h1, addressLine, breadcrumbs, stars, ogImage, bodyText: fullText.substring(0, 6000) };
+                }""")
+                clean_h1 = re.sub(r"[•★*]+.*$", "", raw_meta.get("h1") or "").strip()
+                clean_h1 = re.sub(r"^(Angebote|Hotelbewertungen)\s+", "", clean_h1, flags=re.I).strip()
+                if clean_h1:
+                    meta["name"] = clean_h1
+                if raw_meta.get("stars"):
+                    meta["stars"] = raw_meta["stars"]
+                else:
+                    meta["stars"] = "5"
+                reg, sub_ort = classify_location(
+                    clean_h1,
+                    raw_meta.get("breadcrumbs", ""),
+                    raw_meta.get("addressLine", ""),
+                    raw_meta.get("bodyText", ""),
+                )
+                meta["region"] = reg
+                if sub_ort:
+                    meta["ort"] = sub_ort
+                meta["tags"] = extract_tags_from_text(raw_meta.get("bodyText", ""))
+                if raw_meta.get("ogImage"):
+                    meta["og_image"] = raw_meta["ogImage"]
+            except Exception:
+                pass
+
+        return payloads, blocked, seen, rating, rec, count, meta
     finally:
         page.close()
 
@@ -285,11 +515,15 @@ def append_backup(rows: list) -> None:
         w.writerows(rows)
 
 
-def post_rows(rows: list) -> bool:
-    """Sendet eine Zeilengruppe. Der Webhook ignoriert Duplikate, Wiederholen ist also sicher."""
+def post_rows(rows: list, hotel_updates: list | None = None) -> bool:
+    """Sendet Preiszeilen + optionale Stammdaten-Updates für den Reiter 'hotels'."""
+    payload = {"token": WEBHOOK_TOKEN, "rows": rows}
+    if hotel_updates:
+        payload["hotel_updates"] = hotel_updates
+
     for i in range(1, 4):
         try:
-            r = requests.post(WEBHOOK_URL, json={"token": WEBHOOK_TOKEN, "rows": rows}, timeout=120)
+            r = requests.post(WEBHOOK_URL, json=payload, timeout=120)
             if r.ok and r.text.strip().startswith("ok"):
                 print(f"   ↳ Webhook: {r.text.strip()}")
                 return True
@@ -300,13 +534,17 @@ def post_rows(rows: list) -> bool:
     return False
 
 
-def flush_rows(buffer: list) -> bool:
-    """Sendet den Puffer in Blöcken; gesendete Zeilen werden aus dem Puffer entfernt."""
-    while buffer:
+def flush_rows(buffer: list, updates_buffer: list) -> bool:
+    """Sendet den Puffer in Blöcken; gesendete Daten werden geleert."""
+    if not buffer and not updates_buffer:
+        return True
+    while buffer or updates_buffer:
         chunk = buffer[:POST_CHUNK]
-        if not post_rows(chunk):
+        upd_chunk = list(updates_buffer)
+        if not post_rows(chunk, upd_chunk):
             return False
         del buffer[:len(chunk)]
+        updates_buffer.clear()
     return True
 
 
@@ -323,14 +561,15 @@ def mode_setup():
 
 def mode_probe(hotels, show: bool):
     from playwright.sync_api import sync_playwright
-    name, url = hotels[0]
-    print(f"PROBE mit: {name}\n{url}\n")
+    h = hotels[0]
+    print(f"PROBE mit: {h['name']}\n{h['scrape_url']}\n")
     with sync_playwright() as p:
         ctx = open_context(p, show)
-        payloads, blocked, seen, rating, rec, count = fetch_offers(ctx, url, probe=True)
+        payloads, blocked, seen, rating, rec, count, meta = fetch_offers(ctx, h["scrape_url"], need_meta=True)
         ctx.close()
     print(f"Blockiert: {blocked}")
     print(f"Bewertung: {rating} / 6 | {rec}% | {count} Reviews")
+    print(f"Erkannte Stammdaten: {meta}")
     price, details = extract_price(payloads)
     print(f"Preis (extract_price): {price} [{details}] | Status: {classify_failure(payloads, blocked) if price is None else 'ok'}")
     DEBUG_DIR.mkdir(exist_ok=True)
@@ -345,6 +584,7 @@ def mode_run(hotels, show: bool) -> int:
 
     ts = berlin_now().strftime("%Y-%m-%d %H:%M")
     buffer: list = []
+    updates_buffer: list = []
     stats: dict = defaultdict(int)
     consecutive = 0
     aborted = False
@@ -353,14 +593,22 @@ def mode_run(hotels, show: bool) -> int:
     with sync_playwright() as p:
         ctx = open_context(p, show)
         try:
-            for i, (name, url) in enumerate(hotels, 1):
+            for i, h in enumerate(hotels, 1):
+                name = h["name"]
+                scrape_url = h["scrape_url"]
+                need_meta = h["need_page_meta"]
+
                 print(f"[{i}/{len(hotels)}] {name} ... ", end="", flush=True)
                 price, details, status = None, "", ""
                 payloads, blocked = [], False
                 rating = rec = count = ""
+                meta = {}
+
                 for attempt in (1, 2):
                     try:
-                        payloads, blocked, _, rating, rec, count = fetch_offers(ctx, url)
+                        payloads, blocked, _, rating, rec, count, meta = fetch_offers(
+                            ctx, scrape_url, need_meta=need_meta
+                        )
                         price, details = extract_price(payloads)
                         status = ""
                         if price is not None or blocked:
@@ -369,6 +617,28 @@ def mode_run(hotels, show: bool) -> int:
                         payloads, blocked = [], False
                         status = f"error:{type(e).__name__}"
                     time.sleep(random.uniform(2, 4))
+
+                # Falls Stammdaten fehlten (z. B. Bild-URL oder neues Hotel nur mit Link), Update vormerken
+                upd = dict(h["auto_update"])
+                if not h["has_name"] and meta.get("name"):
+                    name = meta["name"]
+                    upd["name"] = name
+                if not h["has_region"] and meta.get("region"):
+                    upd["region"] = meta["region"]
+                if not h["has_ort"] and meta.get("ort"):
+                    upd["ort"] = meta["ort"]
+                if not h["has_stars"] and meta.get("stars"):
+                    upd["stars"] = meta["stars"]
+                if not h["has_tags"] and meta.get("tags"):
+                    upd["tags"] = meta["tags"]
+                if "image" not in upd and meta.get("og_image"):
+                    upd["image"] = meta["og_image"]
+
+                if upd:
+                    upd["url"] = h["raw_url"]
+                    if not upd.get("name"):
+                        upd["name"] = name
+                    updates_buffer.append(upd)
 
                 if price is not None:
                     row = [ts, name, price, build_details(details, rating, rec, count)]
@@ -379,7 +649,6 @@ def mode_run(hotels, show: bool) -> int:
                     status = status or classify_failure(payloads, blocked)
                     row = [ts, name, "", build_details(f"status={status}", rating, rec, count)]
                     stats[status.split(":")[0]] += 1
-                    # 'no_offer' = API antwortet normal => Verbindung ok, kein Fehlschlag
                     consecutive = 0 if status == "no_offer" else consecutive + 1
                     print(status)
 
@@ -393,12 +662,12 @@ def mode_run(hotels, show: bool) -> int:
 
                 time.sleep(random.uniform(*PAUSE_HOTEL))
                 if i % FLUSH_EVERY == 0:
-                    post_ok = flush_rows(buffer) and post_ok
+                    post_ok = flush_rows(buffer, updates_buffer) and post_ok
                     time.sleep(random.uniform(*PAUSE_BLOCK))
         finally:
             ctx.close()
 
-    post_ok = flush_rows(buffer) and post_ok
+    post_ok = flush_rows(buffer, updates_buffer) and post_ok
     print("\nZusammenfassung:", dict(stats))
     if not post_ok:
         print(f"Webhook-Versand unvollständig – alle Zeilen liegen in {BACKUP_CSV}")
