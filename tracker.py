@@ -2,11 +2,8 @@
 """
 HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Stealth/Xvfb)
 
-Funktionen:
-- Liest aktuelle Pauschalreise-Preise (2 Erw., 7 Tage, FMO/BRE, Juni 2027) über die interne HC-API aus.
-- NEU (1-Link-Autopilot): Füllt fehlende Stammdaten im Reiter 'hotels' (Bild-URL, Name, ID, Region,
-  Ortsteil, Sterne, Tags, Active-Status) automatisch über den Webhook auf.
-  Für neue Hotels reicht es, nur den HolidayCheck-Link in Spalte H (url) einzutragen!
+- Sucht ausschließlich ab Münster/Osnabrück (FMO).
+- Automatischer Stammdaten-Abgleich (1-Link-Regel für Bilder & Metadaten).
 """
 import argparse
 import csv
@@ -26,14 +23,14 @@ from urllib.parse import urlparse
 import requests
 
 # ----------------------------- KONFIGURATION ---------------------------------
-SHEET_ID = os.getenv("SHEET_ID") or "1MG0UwMZbmFoSxCdVp8pqspM5wgtgQlJGyoVesRXd5ag"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN")
+SHEET_ID = "1MG0UwMZbmFoSxCdVp8pqspM5wgtgQlJGyoVesRXd5ag"
+WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbyL8no7Spl4eJMQiZk-hrFBbBhdIitHQF6T7vcCXq7h2tPrsCLyICTYNl4kr0xviLfGtg/exec"
+WEBHOOK_TOKEN = "123456789"
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "msedge")
 API_HINT = os.getenv("API_HINT", "all-offers-service")
 
-# EXAKTE SUCHPARAMETER
-SEARCH_QUERY = "?_offer=airport:~FMO~BRE,departureDate:2027-06-14,returnDate:2027-06-28,duration:7,adults:2"
+# EXAKTE SUCHPARAMETER (Nur Abflughafen Münster/Osnabrück = FMO)
+SEARCH_QUERY = "?_offer=adults:2,airport:~FMO,departureDate:2027-06-14,duration:7,returnDate:2027-06-28,rooms:a-a"
 # -----------------------------------------------------------------------------
 
 MIN_OK, MAX_OK = 1000, 20000
@@ -196,12 +193,6 @@ def fallback_name_from_url(url: str) -> str:
     return "Neues Hotel"
 
 
-def require_env(*names: str) -> None:
-    missing = [n for n in names if not os.getenv(n)]
-    if missing:
-        sys.exit(f"Fehlende Umgebungsvariablen: {', '.join(missing)}")
-
-
 # ------------------------------ Zeit -----------------------------------------
 def _last_sunday(year: int, month: int) -> dt.date:
     d = dt.date(year, month, 31)
@@ -241,7 +232,6 @@ def load_hotels(xlsx: str | None) -> list[dict]:
             continue
 
         active_raw = str(x.get("active") or "").strip().lower()
-        # Nur überspringen, wenn explizit auf FALSE/0/NEIN gesetzt (leere Zelle bei neuen Hotels wird automatisch aktiviert!)
         if active_raw in ("false", "0", "nein", "no", "falsch"):
             continue
 
@@ -253,11 +243,9 @@ def load_hotels(xlsx: str | None) -> list[dict]:
         tags = str(x.get("tags") or "").strip()
         image = str(x.get("image") or "").strip()
 
-        # Saubere Angebots-URL mit den festen Reise-Parametern bauen
         base_url = raw_url.split("?")[0].rstrip("/")
         scrape_url = base_url + SEARCH_QUERY
 
-        # UUID aus dem HolidayCheck-Link ziehen (für ID & automatisches Vorschaubild)
         m_uuid = UUID_RE.search(base_url)
         hc_uuid = m_uuid.group(1).lower() if m_uuid else ""
 
@@ -306,7 +294,7 @@ def to_number(v):
 
 
 def extract_price(payloads: list) -> tuple[float | None, str]:
-    for data in payloads:
+    for data in reversed(payloads):
         if not isinstance(data, dict):
             continue
         offers = (data.get("data") or {}).get("offers", [])
@@ -414,7 +402,7 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
         while time.time() - t0 < WAIT_FOR_API_S and not hits:
             page.wait_for_timeout(500)
         if hits:
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(3500)
         if not hits and re.search(r"access denied|zugriff verweigert", page.title() or "", re.I):
             blocked = True
 
@@ -444,7 +432,6 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
         except Exception:
             pass
 
-        # Falls es ein neues Hotel ist, bei dem Name/Region/Sterne/Tags noch in Sheets fehlen:
         if need_meta and not blocked:
             try:
                 raw_meta = page.evaluate(r"""() => {
@@ -516,7 +503,6 @@ def append_backup(rows: list) -> None:
 
 
 def post_rows(rows: list, hotel_updates: list | None = None) -> bool:
-    """Sendet Preiszeilen + optionale Stammdaten-Updates für den Reiter 'hotels'."""
     payload = {"token": WEBHOOK_TOKEN, "rows": rows}
     if hotel_updates:
         payload["hotel_updates"] = hotel_updates
@@ -535,7 +521,6 @@ def post_rows(rows: list, hotel_updates: list | None = None) -> bool:
 
 
 def flush_rows(buffer: list, updates_buffer: list) -> bool:
-    """Sendet den Puffer in Blöcken; gesendete Daten werden geleert."""
     if not buffer and not updates_buffer:
         return True
     while buffer or updates_buffer:
@@ -546,6 +531,33 @@ def flush_rows(buffer: list, updates_buffer: list) -> bool:
         del buffer[:len(chunk)]
         updates_buffer.clear()
     return True
+
+
+def verify_webhook_and_push_images(hotels: list[dict]) -> bool:
+    print(f"Teste Webhook-Verbindung ({WEBHOOK_URL[:55]}...) ...")
+    initial_updates = []
+    for h in hotels:
+        if h["auto_update"] and not h["need_page_meta"]:
+            upd = dict(h["auto_update"])
+            upd["url"] = h["raw_url"]
+            upd["name"] = h["name"]
+            initial_updates.append(upd)
+            h["auto_update"] = {}
+
+    if initial_updates:
+        print(f"Sende direkt {len(initial_updates)} fehlende Hotel-Bilder an Google Sheets ...")
+        return post_rows([], initial_updates)
+
+    try:
+        r = requests.post(WEBHOOK_URL, json={"token": WEBHOOK_TOKEN, "ping": True}, timeout=30)
+        if r.ok and r.text.strip().startswith("ok"):
+            print(f"   ↳ Webhook-Test erfolgreich: {r.text.strip()}\n")
+            return True
+        print(f"   ↳ Webhook-Test FEHLGESCHLAGEN: {r.status_code} {r.text.strip()[:120]}")
+        return False
+    except requests.RequestException as e:
+        print(f"   ↳ Webhook-Test Netzwerkfehler: {e}")
+        return False
 
 
 # ------------------------------ Modi -----------------------------------------
@@ -580,7 +592,10 @@ def mode_probe(hotels, show: bool):
 
 def mode_run(hotels, show: bool) -> int:
     from playwright.sync_api import sync_playwright
-    require_env("WEBHOOK_URL", "WEBHOOK_TOKEN")
+
+    if not verify_webhook_and_push_images(hotels):
+        print("ABBRUCH VOR START: Bitte Google Apps Script als 'Neue Version' bereitstellen!")
+        return 2
 
     ts = berlin_now().strftime("%Y-%m-%d %H:%M")
     buffer: list = []
@@ -618,7 +633,6 @@ def mode_run(hotels, show: bool) -> int:
                         status = f"error:{type(e).__name__}"
                     time.sleep(random.uniform(2, 4))
 
-                # Falls Stammdaten fehlten (z. B. Bild-URL oder neues Hotel nur mit Link), Update vormerken
                 upd = dict(h["auto_update"])
                 if not h["has_name"] and meta.get("name"):
                     name = meta["name"]
