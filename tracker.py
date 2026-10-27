@@ -24,7 +24,7 @@ import requests
 
 # ----------------------------- KONFIGURATION ---------------------------------
 SHEET_ID = "1MG0UwMZbmFoSxCdVp8pqspM5wgtgQlJGyoVesRXd5ag"
-WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbyL8no7Spl4eJMQiZk-hrFBbBhdIitHQF6T7vcCXq7h2tPrsCLyICTYNl4kr0xviLfGtg/exec"
+WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxKwYhOMuEiqTidrqelTaVWpV4XpneyyHrKqHPqY5JSWjGFG_SFMrhi4Ms1axiiPyoaiA/exec"
 WEBHOOK_TOKEN = "123456789"
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "msedge")
 API_HINT = os.getenv("API_HINT", "all-offers-service")
@@ -242,8 +242,6 @@ def load_hotels(xlsx: str | None) -> list[dict]:
         stars = str(x.get("stars") or "").strip()
         tags = str(x.get("tags") or "").strip()
         image = str(x.get("image") or "").strip()
-        
-        # Lese den RU Fokus aus der neuen Spalte in Google Sheets
         ru_focus = str(x.get("ru_focus") or "").strip()
 
         base_url = raw_url.split("?")[0].rstrip("/")
@@ -541,13 +539,11 @@ def verify_webhook_and_push_images(hotels: list[dict]) -> bool:
     print(f"Teste Webhook-Verbindung ({WEBHOOK_URL[:55]}...) ...")
     initial_updates = []
     
-    # Bekannte Hotelketten mit starkem Fokus auf russische Urlauber
     ru_chains = ["rixos", "granada", "orange county", "justiniano", "lonicera", "dobedan", "alva donna", "kaya", "papillon", "aska", "utopia", "transatlantik", "mirage park", "asteria", "limak", "crystal", "fame residence", "nirvana", "selectum", "sueno", "vonresort", "port nature", "sirene"]
     
     for h in hotels:
         upd = dict(h["auto_update"])
         
-        # Check für bekannte Russische Hotels (auch bei bereits bestehenden Hotels, falls Spalte leer ist)
         if not h["has_ru_focus"]:
             if any(chain in h["name"].lower() for chain in ru_chains):
                 upd["ru_focus"] = "TRUE"
@@ -664,7 +660,6 @@ def mode_run(hotels, show: bool) -> int:
                 if "image" not in upd and meta.get("og_image"):
                     upd["image"] = meta["og_image"]
                     
-                # Auto-Erkennung für neue Hotels
                 if not h["has_ru_focus"]:
                     if any(chain in name.lower() for chain in ru_chains):
                         upd["ru_focus"] = "TRUE"
