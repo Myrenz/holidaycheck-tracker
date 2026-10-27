@@ -2,8 +2,8 @@
 """
 HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Stealth/Xvfb)
 
-- Sucht ausschließlich ab Münster/Osnabrück (FMO).
-- Automatischer Stammdaten-Abgleich (1-Link-Regel für Bilder & Metadaten).
+- Flexibles Urlaubsfenster: 14.06.2027 - 28.06.2027 (7 Tage, Abflug FMO).
+- NEU: Automatischer Check auf bekannten RU-Fokus für russische Hotelketten (bei JEDEM Hotel)!
 """
 import argparse
 import csv
@@ -29,7 +29,7 @@ WEBHOOK_TOKEN = "123456789"
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "msedge")
 API_HINT = os.getenv("API_HINT", "all-offers-service")
 
-# EXAKTE SUCHPARAMETER (Nur Abflughafen Münster/Osnabrück = FMO)
+# EXAKTE SUCHPARAMETER (Flexibel im Urlaubsfenster 14.06.2027 - 28.06.2027, 7 Tage, Abflug FMO, 2 Erw.)
 SEARCH_QUERY = "?_offer=adults:2,airport:~FMO,departureDate:2027-06-14,duration:7,returnDate:2027-06-28,rooms:a-a"
 # -----------------------------------------------------------------------------
 
@@ -242,6 +242,9 @@ def load_hotels(xlsx: str | None) -> list[dict]:
         stars = str(x.get("stars") or "").strip()
         tags = str(x.get("tags") or "").strip()
         image = str(x.get("image") or "").strip()
+        
+        # Lese den RU Fokus aus der neuen Spalte in Google Sheets
+        ru_focus = str(x.get("ru_focus") or "").strip()
 
         base_url = raw_url.split("?")[0].rstrip("/")
         scrape_url = base_url + SEARCH_QUERY
@@ -266,6 +269,7 @@ def load_hotels(xlsx: str | None) -> list[dict]:
             "has_ort": bool(ort),
             "has_stars": bool(stars),
             "has_tags": bool(tags),
+            "has_ru_focus": bool(ru_focus),
             "raw_url": raw_url,
             "scrape_url": scrape_url,
             "auto_update": auto_update,
@@ -536,16 +540,26 @@ def flush_rows(buffer: list, updates_buffer: list) -> bool:
 def verify_webhook_and_push_images(hotels: list[dict]) -> bool:
     print(f"Teste Webhook-Verbindung ({WEBHOOK_URL[:55]}...) ...")
     initial_updates = []
+    
+    # Bekannte Hotelketten mit starkem Fokus auf russische Urlauber
+    ru_chains = ["rixos", "granada", "orange county", "justiniano", "lonicera", "dobedan", "alva donna", "kaya", "papillon", "aska", "utopia", "transatlantik", "mirage park", "asteria", "limak", "crystal", "fame residence", "nirvana", "selectum", "sueno", "vonresort", "port nature", "sirene"]
+    
     for h in hotels:
-        if h["auto_update"] and not h["need_page_meta"]:
-            upd = dict(h["auto_update"])
+        upd = dict(h["auto_update"])
+        
+        # Check für bekannte Russische Hotels (auch bei bereits bestehenden Hotels, falls Spalte leer ist)
+        if not h["has_ru_focus"]:
+            if any(chain in h["name"].lower() for chain in ru_chains):
+                upd["ru_focus"] = "TRUE"
+                
+        if upd:
             upd["url"] = h["raw_url"]
             upd["name"] = h["name"]
             initial_updates.append(upd)
-            h["auto_update"] = {}
+        h["auto_update"] = {}
 
     if initial_updates:
-        print(f"Sende direkt {len(initial_updates)} fehlende Hotel-Bilder an Google Sheets ...")
+        print(f"Sende direkt {len(initial_updates)} Stammdaten-Updates an Google Sheets ...")
         return post_rows([], initial_updates)
 
     try:
@@ -604,6 +618,8 @@ def mode_run(hotels, show: bool) -> int:
     consecutive = 0
     aborted = False
     post_ok = True
+    
+    ru_chains = ["rixos", "granada", "orange county", "justiniano", "lonicera", "dobedan", "alva donna", "kaya", "papillon", "aska", "utopia", "transatlantik", "mirage park", "asteria", "limak", "crystal", "fame residence", "nirvana", "selectum", "sueno", "vonresort", "port nature", "sirene"]
 
     with sync_playwright() as p:
         ctx = open_context(p, show)
@@ -647,6 +663,11 @@ def mode_run(hotels, show: bool) -> int:
                     upd["tags"] = meta["tags"]
                 if "image" not in upd and meta.get("og_image"):
                     upd["image"] = meta["og_image"]
+                    
+                # Auto-Erkennung für neue Hotels
+                if not h["has_ru_focus"]:
+                    if any(chain in name.lower() for chain in ru_chains):
+                        upd["ru_focus"] = "TRUE"
 
                 if upd:
                     upd["url"] = h["raw_url"]
