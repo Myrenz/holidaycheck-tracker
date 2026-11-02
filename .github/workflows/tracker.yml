@@ -3,14 +3,17 @@ name: HolidayCheck Tracker
 on:
   workflow_dispatch: # Erlaubt dir weiterhin den manuellen Start per Button
   schedule:
-    # 06:30 Uhr deutsche Sommerzeit (04:30 UTC)
-    - cron: '30 4 * * *'
-    # 12:00 Uhr deutsche Sommerzeit (10:00 UTC)
-    - cron: '0 10 * * *'
-    # 16:00 Uhr deutsche Sommerzeit (14:00 UTC)
-    - cron: '0 14 * * *'
-    # 20:00 Uhr deutsche Sommerzeit (18:00 UTC)
-    - cron: '0 18 * * *'
+    # Zeiten in UTC (Aktuell Winterzeit in DE: UTC+1)
+    # 06:00 Uhr deutsche Zeit (05:00 UTC)
+    - cron: '0 5 * * *'
+    # 09:45 Uhr deutsche Zeit (08:45 UTC)
+    - cron: '45 8 * * *'
+    # 13:30 Uhr deutsche Zeit (12:30 UTC)
+    - cron: '30 12 * * *'
+    # 17:15 Uhr deutsche Zeit (16:15 UTC)
+    - cron: '15 16 * * *'
+    # 21:00 Uhr deutsche Zeit (20:00 UTC)
+    - cron: '0 20 * * *'
 
 jobs:
   track:
