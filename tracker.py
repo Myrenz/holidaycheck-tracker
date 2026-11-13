@@ -3,7 +3,8 @@
 HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Stealth/Xvfb)
 
 - Flexibles Urlaubsfenster: 14.06.2027 - 28.06.2027 (7 Tage, Abflug FMO).
-- NEU: Automatischer Check auf bekannten RU-Fokus für russische Hotelketten (bei JEDEM Hotel)!
+- Automatischer Check auf bekannten RU-Fokus für russische Hotelketten.
+- Stabilitäts-Update für GitHub Actions (Chromium-Fallback, Polling auf echte Angebote, Crash-Recovery).
 """
 import argparse
 import csv
@@ -23,10 +24,13 @@ from urllib.parse import urlparse
 import requests
 
 # ----------------------------- KONFIGURATION ---------------------------------
-SHEET_ID = "1MG0UwMZbmFoSxCdVp8pqspM5wgtgQlJGyoVesRXd5ag"
-WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxKwYhOMuEiqTidrqelTaVWpV4XpneyyHrKqHPqY5JSWjGFG_SFMrhi4Ms1axiiPyoaiA/exec"
-WEBHOOK_TOKEN = "123456789"
-BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "msedge")
+SHEET_ID = os.getenv("SHEET_ID", "").strip()
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "123456789").strip()
+
+# Auf Windows standardmäßig msedge, auf Linux (GitHub Actions) chromium nutzen
+DEFAULT_CHANNEL = "msedge" if sys.platform == "win32" else "chromium"
+BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", DEFAULT_CHANNEL)
 API_HINT = os.getenv("API_HINT", "all-offers-service")
 
 # EXAKTE SUCHPARAMETER (Flexibel im Urlaubsfenster 14.06.2027 - 28.06.2027, 7 Tage, Abflug FMO, 2 Erw.)
@@ -296,28 +300,39 @@ def to_number(v):
 
 
 def extract_price(payloads: list) -> tuple[float | None, str]:
+    best_price = None
+    best_source = ""
     for data in reversed(payloads):
         if not isinstance(data, dict):
             continue
         offers = (data.get("data") or {}).get("offers", [])
-        if isinstance(offers, list) and len(offers) > 0:
-            first_offer = offers[0]
-
-            tp = first_offer.get("totalPrice", {})
+        if not isinstance(offers, list) or len(offers) == 0:
+            continue
+        for offer in offers:
+            if not isinstance(offer, dict):
+                continue
+            val, src = None, ""
+            tp = offer.get("totalPrice", {})
             if isinstance(tp, dict):
-                val = to_number(tp.get("amount") or tp.get("value"))
-                if val is not None and MIN_OK <= val <= MAX_OK:
-                    return val, "api=totalPrice"
+                v = to_number(tp.get("amount") or tp.get("value"))
+                if v is not None and MIN_OK <= v <= MAX_OK:
+                    val, src = v, "api=totalPrice"
             elif isinstance(tp, (int, float)):
                 if MIN_OK <= float(tp) <= MAX_OK:
-                    return float(tp), "api=totalPrice(raw)"
+                    val, src = float(tp), "api=totalPrice(raw)"
 
-            p = first_offer.get("price", {})
-            if isinstance(p, dict):
-                val = to_number(p.get("amount") or p.get("value"))
-                if val is not None and MIN_OK <= val <= MAX_OK:
-                    return val, "api=price"
-    return None, ""
+            if val is None:
+                p = offer.get("price", {})
+                if isinstance(p, dict):
+                    v = to_number(p.get("amount") or p.get("value"))
+                    if v is not None and MIN_OK <= v <= MAX_OK:
+                        val, src = v, "api=price"
+
+            if val is not None:
+                if best_price is None or val < best_price:
+                    best_price = val
+                    best_source = src
+    return best_price, best_source
 
 
 def classify_failure(payloads: list, blocked: bool) -> str:
@@ -353,6 +368,7 @@ def open_context(p, show: bool):
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
+        "--disable-gpu",
         "--window-size=1920,1080",
     ]
     kwargs = {
@@ -360,12 +376,16 @@ def open_context(p, show: bool):
         "locale": "de-DE",
         "timezone_id": "Europe/Berlin",
         "viewport": {"width": 1920, "height": 1080},
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "args": launch_args,
     }
     if BROWSER_CHANNEL and BROWSER_CHANNEL != "chromium":
         kwargs["channel"] = BROWSER_CHANNEL
-    ctx = p.chromium.launch_persistent_context(str(PROFILE_DIR), **kwargs)
+    try:
+        ctx = p.chromium.launch_persistent_context(str(PROFILE_DIR), **kwargs)
+    except Exception:
+        kwargs.pop("channel", None)
+        ctx = p.chromium.launch_persistent_context(str(PROFILE_DIR), **kwargs)
     ctx.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
     return ctx
 
@@ -400,11 +420,25 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
         main = page.goto(url, wait_until="domcontentloaded", timeout=60_000)
         if main is not None and main.status in (403, 429):
             blocked = True
+
+        # Wartet geduldig, bis tatsächlich Angebote im Datenstrom enthalten sind (max. WAIT_FOR_API_S)
         t0 = time.time()
-        while time.time() - t0 < WAIT_FOR_API_S and not hits:
-            page.wait_for_timeout(500)
-        if hits:
-            page.wait_for_timeout(3500)
+        has_real_offers = False
+        while time.time() - t0 < WAIT_FOR_API_S:
+            for r in list(hits):
+                try:
+                    data = r.json()
+                    offers = (data.get("data") or {}).get("offers", [])
+                    if isinstance(offers, list) and len(offers) > 0:
+                        has_real_offers = True
+                        break
+                except Exception:
+                    pass
+            if has_real_offers:
+                page.wait_for_timeout(1500)
+                break
+            page.wait_for_timeout(750)
+
         if not hits and re.search(r"access denied|zugriff verweigert", page.title() or "", re.I):
             blocked = True
 
@@ -491,7 +525,10 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
 
         return payloads, blocked, seen, rating, rec, count, meta
     finally:
-        page.close()
+        try:
+            page.close()
+        except Exception:
+            pass
 
 
 # ------------------------------ Versand --------------------------------------
@@ -642,7 +679,17 @@ def mode_run(hotels, show: bool) -> int:
                             break
                     except Exception as e:
                         payloads, blocked = [], False
-                        status = f"error:{type(e).__name__}"
+                        err_msg = str(e).splitlines()[0][:80] if str(e) else ""
+                        status = f"error:{type(e).__name__}({err_msg})"
+                        # Falls der Browser-Kontext abgestürzt ist, vor Versuch 2 frisch öffnen
+                        try:
+                            ctx.close()
+                        except Exception:
+                            pass
+                        try:
+                            ctx = open_context(p, show)
+                        except Exception:
+                            pass
                     time.sleep(random.uniform(2, 4))
 
                 upd = dict(h["auto_update"])
@@ -695,7 +742,10 @@ def mode_run(hotels, show: bool) -> int:
                     post_ok = flush_rows(buffer, updates_buffer) and post_ok
                     time.sleep(random.uniform(*PAUSE_BLOCK))
         finally:
-            ctx.close()
+            try:
+                ctx.close()
+            except Exception:
+                pass
 
     post_ok = flush_rows(buffer, updates_buffer) and post_ok
     print("\nZusammenfassung:", dict(stats))
