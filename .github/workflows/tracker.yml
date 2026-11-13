@@ -1,25 +1,21 @@
 name: HolidayCheck Tracker
 
 on:
-  workflow_dispatch: # Erlaubt dir weiterhin den manuellen Start per Button
+  workflow_dispatch: # Erlaubt weiterhin den manuellen Start per Button
   schedule:
-    # Zeiten in UTC (Aktuell Winterzeit in DE: UTC+1)
-    # 06:00 Uhr deutsche Zeit (05:00 UTC)
-    - cron: '0 5 * * *'
-    # 09:45 Uhr deutsche Zeit (08:45 UTC)
-    - cron: '45 8 * * *'
-    # 13:30 Uhr deutsche Zeit (12:30 UTC)
-    - cron: '30 12 * * *'
-    # 17:15 Uhr deutsche Zeit (16:15 UTC)
-    - cron: '15 16 * * *'
-    # 21:00 Uhr deutsche Zeit (20:00 UTC)
-    - cron: '0 20 * * *'
+    # Zeiten in UTC (Winterzeit in DE = UTC+1)
+    # Leicht ungerade Minuten verhindern, dass GitHub Läufe zur vollen Stunde überspringt
+    - cron: '3 5 * * *'    # 06:03 Uhr deutsche Zeit
+    - cron: '45 8 * * *'   # 09:45 Uhr deutsche Zeit
+    - cron: '30 12 * * *'  # 13:30 Uhr deutsche Zeit
+    - cron: '15 16 * * *'  # 17:15 Uhr deutsche Zeit
+    - cron: '3 20 * * *'   # 21:03 Uhr deutsche Zeit
 
 jobs:
   track:
-    runs-on: ubuntu-latest
-    timeout-minutes: 90  # Großzügiges Limit für über 200 Hotels
-    
+    runs-on: ubuntu-24.04  # Fest auf 24.04 gepinnt (verhindert DNS- & Sandbox-Crashes von Ubuntu 26.04)
+    timeout-minutes: 90
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -37,9 +33,9 @@ jobs:
 
       - name: Run Tracker
         env:
-          # Hier holt sich GitHub deine geheimen Daten aus dem Tresor
           SHEET_ID: ${{ secrets.SHEET_ID }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
+          BROWSER_CHANNEL: chromium
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python tracker.py --show
