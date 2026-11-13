@@ -24,9 +24,9 @@ from urllib.parse import urlparse
 import requests
 
 # ----------------------------- KONFIGURATION ---------------------------------
-SHEET_ID = os.getenv("SHEET_ID", "").strip()
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
-WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "123456789").strip()
+SHEET_ID = os.getenv("SHEET_ID") or "1MG0UwMZbmFoSxCdVp8pqspM5wgtgQlJGyoVesRXd5ag"
+WEBHOOK_URL = os.getenv("WEBHOOK_URL") or "https://script.google.com/macros/s/AKfycbxKwYhOMuEiqTidrqelTaVWpV4XpneyyHrKqHPqY5JSWjGFG_SFMrhi4Ms1axiiPyoaiA/exec"
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN") or "123456789"
 
 # Auf Windows standardmäßig msedge, auf Linux (GitHub Actions) chromium nutzen
 DEFAULT_CHANNEL = "msedge" if sys.platform == "win32" else "chromium"
