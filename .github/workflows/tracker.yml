@@ -30,69 +30,67 @@ jobs:
           pip install requests playwright openpyxl
           playwright install --with-deps chromium
 
-      - name: Start WireGuard VPN
+      - name: Start WireGuard VPN (Isolierter Namespace)
         env:
           WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
         run: |
-          # Hostname lokal eintragen, damit sudo ohne DNS-Verzögerung läuft
-          echo "127.0.0.1 $(hostname)" | sudo tee -a /etc/hosts > /dev/null
-
           sudo apt-get update -qq
           sudo apt-get install -y -qq wireguard-tools
 
-          WG_DNS=$(printf '%s\n' "$WIREGUARD_CONFIG" | tr -d '\r' | grep -i '^[[:space:]]*DNS[[:space:]]*=' | head -n1 | cut -d'=' -f2 | cut -d',' -f1 | tr -d ' ' || true)
+          CLEAN_CFG=$(printf '%s\n' "$WIREGUARD_CONFIG" | tr -d '\r')
+          WG_ADDR=$(printf '%s\n' "$CLEAN_CFG" | grep -i '^[[:space:]]*Address[[:space:]]*=' | head -n1 | cut -d'=' -f2- | tr ',' '\n' | grep -v ':' | head -n1 | tr -d ' ' || true)
+          WG_DNS=$(printf '%s\n' "$CLEAN_CFG" | grep -i '^[[:space:]]*DNS[[:space:]]*=' | head -n1 | cut -d'=' -f2- | tr ',' '\n' | grep -E '^[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+[[:space:]]*$' | head -n1 | tr -d ' ' || true)
 
-          printf '%s\n' "$WIREGUARD_CONFIG" \
-            | tr -d '\r' \
-            | grep -viE '^[[:space:]]*(DNS|MTU)[[:space:]]*=' \
-            | sed -E 's/,?[[:space:]]*::\/0//g; s/=[[:space:]]*,/= /; s/,[[:space:]]*$//' \
-            | sed -E '/^[[:space:]]*\[Interface\]/a MTU = 1280' \
-            | sudo tee /etc/wireguard/wg0.conf > /dev/null
-          sudo chmod 600 /etc/wireguard/wg0.conf
-
-          echo "IP vor VPN: $(curl -4 -s --max-time 10 https://api.ipify.org || echo unbekannt)"
-          sudo wg-quick up wg0
-
-          sudo rm -f /etc/resolv.conf
-          if [ -n "$WG_DNS" ]; then
-            printf "nameserver %s\nnameserver 1.1.1.1\noptions timeout:2 attempts:2\n" "$WG_DNS" | sudo tee /etc/resolv.conf > /dev/null
-          else
-            printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2\n" | sudo tee /etc/resolv.conf > /dev/null
+          if [ -z "$WG_ADDR" ]; then
+            echo "FEHLER: Keine IPv4-Adresse in WIREGUARD_CONFIG gefunden."
+            exit 1
           fi
 
+          # Reine WireGuard-Config ohne wg-quick-Zusatzfelder erzeugen
+          sudo mkdir -p /etc/wireguard /etc/netns/vpn
+          printf '%s\n' "$CLEAN_CFG" \
+            | grep -viE '^[[:space:]]*(Address|DNS|MTU|Table|PreUp|PostUp|PreDown|PostDown|SaveConfig)[[:space:]]*=' \
+            | sed -E 's/,?[[:space:]]*::\/0//g; s/=[[:space:]]*,/= /; s/,[[:space:]]*$//' \
+            | sudo tee /etc/wireguard/wg0-raw.conf > /dev/null
+          sudo chmod 600 /etc/wireguard/wg0-raw.conf
+
+          # DNS nur für den isolierten Namespace 'vpn' setzen
+          if [ -n "$WG_DNS" ]; then
+            printf "nameserver %s\nnameserver 1.1.1.1\noptions timeout:2 attempts:2\n" "$WG_DNS" | sudo tee /etc/netns/vpn/resolv.conf > /dev/null
+          else
+            printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2\n" | sudo tee /etc/netns/vpn/resolv.conf > /dev/null
+          fi
+
+          echo "Host-IP (GitHub Runner): $(curl -4 -s --max-time 10 https://api.ipify.org || echo unbekannt)"
+
+          # wg0 auf dem Host anlegen (UDP-Tunnel nutzt AWS-Netz) und in Namespace 'vpn' verschieben
+          sudo ip link add wg0 type wireguard
+          sudo wg setconf wg0 /etc/wireguard/wg0-raw.conf
+          sudo ip netns add vpn
+          sudo ip link set wg0 netns vpn
+          sudo ip -n vpn link set lo up
+          sudo ip -n vpn addr add "$WG_ADDR" dev wg0
+          sudo ip -n vpn link set wg0 mtu 1280 up
+          sudo ip -n vpn route add default dev wg0
+
           sleep 2
-          # IP direkt über Cloudflare-Trace prüfen (ohne DNS-Abhängigkeit, blockt keine VPNs)
-          TRACE=$(curl -4 -fsS --max-time 15 https://1.1.1.1/cdn-cgi/trace 2>&1 || true)
+          TRACE=$(sudo ip netns exec vpn curl -4 -fsS --max-time 15 https://1.1.1.1/cdn-cgi/trace 2>&1 || true)
           VPN_IP=$(printf '%s\n' "$TRACE" | awk -F= '/^ip=/{print $2}' | tr -d '\r\n')
           VPN_LOC=$(printf '%s\n' "$TRACE" | awk -F= '/^loc=/{print $2}' | tr -d '\r\n')
 
-          # Fallback über DNS-basierte Prüfung
-          if [ -z "$VPN_IP" ]; then
-            VPN_IP=$(curl -4 -fsS --max-time 15 https://icanhazip.com 2>/dev/null | tr -d '\r\n' || true)
-          fi
-
-          # DNS testen und bei Hänger automatisch auf 1.1.1.1 umschalten
-          if [ -n "$VPN_IP" ] && ! curl -4 -fsS --max-time 10 https://icanhazip.com > /dev/null 2>&1; then
-            echo "DNS über ${WG_DNS:-Standard} klemmt, wechsle auf 1.1.1.1 / 8.8.8.8 ..."
-            printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2\n" | sudo tee /etc/resolv.conf > /dev/null
+          # DNS im VPN-Namespace testen; bei Bedarf auf 1.1.1.1 umschalten
+          if [ -n "$VPN_IP" ] && ! sudo ip netns exec vpn curl -4 -fsS --max-time 10 https://icanhazip.com > /dev/null 2>&1; then
+            echo "DNS über ${WG_DNS:-Standard} klemmt, wechsle im VPN-Namespace auf 1.1.1.1 / 8.8.8.8 ..."
+            printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2\n" | sudo tee /etc/netns/vpn/resolv.conf > /dev/null
           fi
 
           if [ -z "$VPN_IP" ]; then
-            echo "FEHLER: Keine Verbindung über WireGuard. Diagnose:"
-            echo "--- Cloudflare Trace / Fehler ---"
+            echo "FEHLER: Keine Verbindung im VPN-Namespace. Diagnose:"
             echo "$TRACE"
-            echo "--- HTTP-Test (Klartext) ---"
-            curl -4 -v --max-time 10 http://checkip.amazonaws.com || true
-            echo "--- /etc/resolv.conf ---"
-            cat /etc/resolv.conf || true
-            echo "--- Routing ---"
-            ip -4 route show || true
-            echo "--- WireGuard ---"
-            sudo wg show || true
-            sudo wg-quick down wg0 || true
+            sudo ip netns exec vpn wg show || true
             exit 1
           fi
-          echo "IP über VPN: $VPN_IP (Land: ${VPN_LOC:-unbekannt})"
+          echo "IP im VPN-Namespace: $VPN_IP (Land: ${VPN_LOC:-unbekannt})"
 
       - name: Run Tracker
         env:
@@ -101,9 +99,19 @@ jobs:
           WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
           BROWSER_CHANNEL: chromium
         run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python tracker.py --show
+          sudo ip netns exec vpn sudo -u "$USER" env \
+            "PATH=$PATH" \
+            "HOME=$HOME" \
+            "SHEET_ID=$SHEET_ID" \
+            "WEBHOOK_URL=$WEBHOOK_URL" \
+            "WEBHOOK_TOKEN=$WEBHOOK_TOKEN" \
+            "BROWSER_CHANNEL=$BROWSER_CHANNEL" \
+            xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+            python -u tracker.py --show
 
       - name: Stop WireGuard VPN
         if: always()
         run: |
-          sudo wg-quick down wg0 || true
+          sudo ip netns del vpn 2>/dev/null || true
+          sudo ip link del wg0 2>/dev/null || true
+          sudo rm -rf /etc/netns/vpn /etc/wireguard/wg0-raw.conf
