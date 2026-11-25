@@ -34,13 +34,14 @@ jobs:
         env:
           WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
         run: |
+          # Hostname lokal eintragen, damit sudo ohne DNS-Verzögerung läuft
+          echo "127.0.0.1 $(hostname)" | sudo tee -a /etc/hosts > /dev/null
+
           sudo apt-get update -qq
           sudo apt-get install -y -qq wireguard-tools
 
-          # DNS aus Config auslesen (z. B. 10.2.0.1 bei Proton; || true verhindert Abbruch falls leer)
           WG_DNS=$(printf '%s\n' "$WIREGUARD_CONFIG" | tr -d '\r' | grep -i '^[[:space:]]*DNS[[:space:]]*=' | head -n1 | cut -d'=' -f2 | cut -d',' -f1 | tr -d ' ' || true)
 
-          # Config bereinigen und MTU fest auf 1280 setzen (Fix gegen AWS-Jumbo-Frames 8921)
           printf '%s\n' "$WIREGUARD_CONFIG" \
             | tr -d '\r' \
             | grep -viE '^[[:space:]]*(DNS|MTU)[[:space:]]*=' \
@@ -54,20 +55,44 @@ jobs:
 
           sudo rm -f /etc/resolv.conf
           if [ -n "$WG_DNS" ]; then
-            printf "nameserver %s\nnameserver 1.1.1.1\n" "$WG_DNS" | sudo tee /etc/resolv.conf > /dev/null
+            printf "nameserver %s\nnameserver 1.1.1.1\noptions timeout:2 attempts:2\n" "$WG_DNS" | sudo tee /etc/resolv.conf > /dev/null
           else
-            printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" | sudo tee /etc/resolv.conf > /dev/null
+            printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2\n" | sudo tee /etc/resolv.conf > /dev/null
           fi
 
           sleep 2
-          VPN_IP=$(curl -4 -s --max-time 15 https://api.ipify.org || curl -4 -s --max-time 15 https://ifconfig.me || true)
+          # IP direkt über Cloudflare-Trace prüfen (ohne DNS-Abhängigkeit, blockt keine VPNs)
+          TRACE=$(curl -4 -fsS --max-time 15 https://1.1.1.1/cdn-cgi/trace 2>&1 || true)
+          VPN_IP=$(printf '%s\n' "$TRACE" | awk -F= '/^ip=/{print $2}' | tr -d '\r\n')
+          VPN_LOC=$(printf '%s\n' "$TRACE" | awk -F= '/^loc=/{print $2}' | tr -d '\r\n')
+
+          # Fallback über DNS-basierte Prüfung
+          if [ -z "$VPN_IP" ]; then
+            VPN_IP=$(curl -4 -fsS --max-time 15 https://icanhazip.com 2>/dev/null | tr -d '\r\n' || true)
+          fi
+
+          # DNS testen und bei Hänger automatisch auf 1.1.1.1 umschalten
+          if [ -n "$VPN_IP" ] && ! curl -4 -fsS --max-time 10 https://icanhazip.com > /dev/null 2>&1; then
+            echo "DNS über ${WG_DNS:-Standard} klemmt, wechsle auf 1.1.1.1 / 8.8.8.8 ..."
+            printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2\n" | sudo tee /etc/resolv.conf > /dev/null
+          fi
+
           if [ -z "$VPN_IP" ]; then
             echo "FEHLER: Keine Verbindung über WireGuard. Diagnose:"
-            sudo wg show
+            echo "--- Cloudflare Trace / Fehler ---"
+            echo "$TRACE"
+            echo "--- HTTP-Test (Klartext) ---"
+            curl -4 -v --max-time 10 http://checkip.amazonaws.com || true
+            echo "--- /etc/resolv.conf ---"
+            cat /etc/resolv.conf || true
+            echo "--- Routing ---"
+            ip -4 route show || true
+            echo "--- WireGuard ---"
+            sudo wg show || true
             sudo wg-quick down wg0 || true
             exit 1
           fi
-          echo "IP über VPN: $VPN_IP"
+          echo "IP über VPN: $VPN_IP (Land: ${VPN_LOC:-unbekannt})"
 
       - name: Run Tracker
         env:
