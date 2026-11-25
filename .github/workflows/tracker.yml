@@ -1,19 +1,17 @@
 name: HolidayCheck Tracker
 
 on:
-  workflow_dispatch: # Erlaubt weiterhin den manuellen Start per Button
+  workflow_dispatch:
   schedule:
-    # Zeiten in UTC (Winterzeit in DE = UTC+1)
-    # Leicht ungerade Minuten verhindern, dass GitHub Läufe zur vollen Stunde überspringt
-    - cron: '3 5 * * *'    # 06:03 Uhr deutsche Zeit
-    - cron: '45 8 * * *'   # 09:45 Uhr deutsche Zeit
-    - cron: '30 12 * * *'  # 13:30 Uhr deutsche Zeit
-    - cron: '15 16 * * *'  # 17:15 Uhr deutsche Zeit
-    - cron: '3 20 * * *'   # 21:03 Uhr deutsche Zeit
+    - cron: '3 5 * * *'    # 06:03 Uhr DE
+    - cron: '45 8 * * *'   # 09:45 Uhr DE
+    - cron: '30 12 * * *'  # 13:30 Uhr DE
+    - cron: '15 16 * * *'  # 17:15 Uhr DE
+    - cron: '3 20 * * *'   # 21:03 Uhr DE
 
 jobs:
   track:
-    runs-on: ubuntu-24.04  # Fest auf 24.04 gepinnt (verhindert DNS- & Sandbox-Crashes von Ubuntu 26.04)
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
 
     steps:
@@ -31,6 +29,33 @@ jobs:
           pip install requests playwright openpyxl
           playwright install --with-deps chromium
 
+      - name: Start WireGuard VPN
+        env:
+          WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wireguard-tools
+
+          printf '%s\n' "$WIREGUARD_CONFIG" \
+            | tr -d '\r' \
+            | grep -vi '^[[:space:]]*DNS[[:space:]]*=' \
+            | sed -E 's/,?[[:space:]]*::\/0//g; s/=[[:space:]]*,/= /; s/,[[:space:]]*$//' \
+            | sudo tee /etc/wireguard/wg0.conf > /dev/null
+          sudo chmod 600 /etc/wireguard/wg0.conf
+
+          echo "IP vor VPN: $(curl -4 -s --max-time 10 https://api.ipify.org || echo unbekannt)"
+          sudo wg-quick up wg0
+          sudo rm -f /etc/resolv.conf
+          printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" | sudo tee /etc/resolv.conf > /dev/null
+
+          VPN_IP=$(curl -4 -s --max-time 15 https://api.ipify.org || true)
+          if [ -z "$VPN_IP" ]; then
+            echo "FEHLER: Keine Verbindung über WireGuard."
+            sudo wg-quick down wg0 || true
+            exit 1
+          fi
+          echo "IP über VPN: $VPN_IP"
+
       - name: Run Tracker
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
@@ -39,3 +64,8 @@ jobs:
           BROWSER_CHANNEL: chromium
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python tracker.py --show
+
+      - name: Stop WireGuard VPN
+        if: always()
+        run: |
+          sudo wg-quick down wg0 || true
