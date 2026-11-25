@@ -3,6 +3,7 @@ name: HolidayCheck Tracker
 on:
   workflow_dispatch:
   schedule:
+    # Zeiten in UTC (Winterzeit in DE = UTC+1)
     - cron: '3 5 * * *'    # 06:03 Uhr DE
     - cron: '45 8 * * *'   # 09:45 Uhr DE
     - cron: '30 12 * * *'  # 13:30 Uhr DE
@@ -36,21 +37,33 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq wireguard-tools
 
+          # DNS aus Config auslesen (z. B. 10.2.0.1 bei Proton; || true verhindert Abbruch falls leer)
+          WG_DNS=$(printf '%s\n' "$WIREGUARD_CONFIG" | tr -d '\r' | grep -i '^[[:space:]]*DNS[[:space:]]*=' | head -n1 | cut -d'=' -f2 | cut -d',' -f1 | tr -d ' ' || true)
+
+          # Config bereinigen und MTU fest auf 1280 setzen (Fix gegen AWS-Jumbo-Frames 8921)
           printf '%s\n' "$WIREGUARD_CONFIG" \
             | tr -d '\r' \
-            | grep -vi '^[[:space:]]*DNS[[:space:]]*=' \
+            | grep -viE '^[[:space:]]*(DNS|MTU)[[:space:]]*=' \
             | sed -E 's/,?[[:space:]]*::\/0//g; s/=[[:space:]]*,/= /; s/,[[:space:]]*$//' \
+            | sed -E '/^[[:space:]]*\[Interface\]/a MTU = 1280' \
             | sudo tee /etc/wireguard/wg0.conf > /dev/null
           sudo chmod 600 /etc/wireguard/wg0.conf
 
           echo "IP vor VPN: $(curl -4 -s --max-time 10 https://api.ipify.org || echo unbekannt)"
           sudo wg-quick up wg0
-          sudo rm -f /etc/resolv.conf
-          printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" | sudo tee /etc/resolv.conf > /dev/null
 
-          VPN_IP=$(curl -4 -s --max-time 15 https://api.ipify.org || true)
+          sudo rm -f /etc/resolv.conf
+          if [ -n "$WG_DNS" ]; then
+            printf "nameserver %s\nnameserver 1.1.1.1\n" "$WG_DNS" | sudo tee /etc/resolv.conf > /dev/null
+          else
+            printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" | sudo tee /etc/resolv.conf > /dev/null
+          fi
+
+          sleep 2
+          VPN_IP=$(curl -4 -s --max-time 15 https://api.ipify.org || curl -4 -s --max-time 15 https://ifconfig.me || true)
           if [ -z "$VPN_IP" ]; then
-            echo "FEHLER: Keine Verbindung über WireGuard."
+            echo "FEHLER: Keine Verbindung über WireGuard. Diagnose:"
+            sudo wg show
             sudo wg-quick down wg0 || true
             exit 1
           fi
