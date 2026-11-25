@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Stealth/Xvfb)
+HolidayCheck-Preistracker (Lokal & Cloud mit Patchright-Stealth)
 
 - Flexibles Urlaubsfenster: 14.06.2027 - 28.06.2027 (7 Tage, Abflug FMO).
 - Automatischer Check auf bekannten RU-Fokus für russische Hotelketten.
-- Stabilitäts- & Diagnose-Update:
-  * Kein künstliches Blockieren von Bildern/Fonts/CSS (verhindert Akamai-/Consent-Störungen)
-  * Cookie-Banner wird auch innerhalb von iframes (z. B. Sourcepoint) automatisch geklickt
-  * Erkennt API-Blockaden (403/429) direkt statt fälschlich 'no_response' zu melden
-  * Gibt beim ersten Fehlschlag URL, Seitentitel, Frames, Seitentext & gesehene APIs im Log aus
+- Patchright-Stealth-Update:
+  * Nutzt Patchright (entfernt Playwrights CDP-Bot-Signatur gegen Akamai-400-Sperren)
+  * Verwendet auf Windows standardmäßig Chrome (Fallback: Edge / Chromium)
+  * Kein erkennbares webdriver-Init-Script und keine künstliche Viewport-Überschreibung
+  * Erkennt HTTP 400/403/429 sofort ohne 40s-Timeout
+  * Klickt Cookie-Banner auch innerhalb von iframes (z. B. Sourcepoint)
 """
 import argparse
 import csv
@@ -28,14 +29,13 @@ from urllib.parse import urlparse
 import requests
 
 # ----------------------------- KONFIGURATION ---------------------------------
-# In GitHub Actions werden diese Werte automatisch aus den Repository-Secrets geladen.
-# Für lokale Tests auf dem eigenen PC ohne Umgebungsvariablen ggf. nach dem "or" eintragen.
+# Werden automatisch aus Umgebungsvariablen (start_tracker.bat oder GitHub Secrets) geladen.
 SHEET_ID = (os.getenv("SHEET_ID") or "").strip()
 WEBHOOK_URL = (os.getenv("WEBHOOK_URL") or "").strip()
 WEBHOOK_TOKEN = (os.getenv("WEBHOOK_TOKEN") or "123456789").strip()
 
-# Auf Windows standardmäßig msedge, auf Linux (GitHub Actions) chromium nutzen
-DEFAULT_CHANNEL = "msedge" if sys.platform == "win32" else "chromium"
+# Auf Windows standardmäßig chrome (Fallback: msedge / chromium), auf Linux chromium
+DEFAULT_CHANNEL = "chrome" if sys.platform == "win32" else "chromium"
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", DEFAULT_CHANNEL)
 API_HINT = os.getenv("API_HINT", "all-offers-service")
 
@@ -375,33 +375,45 @@ def build_details(base: str, rating: str, rec: str, count: str) -> str:
 
 
 # ------------------------------ Browser --------------------------------------
+def get_sync_playwright():
+    try:
+        from patchright.sync_api import sync_playwright
+        print("Browser-Engine: Patchright (Stealth aktiv)")
+        return sync_playwright
+    except ImportError:
+        from playwright.sync_api import sync_playwright
+        print("WARNUNG: Patchright nicht installiert (Fallback auf Playwright). Bitte 'pip install patchright' ausführen!")
+        return sync_playwright
+
+
 def open_context(p, show: bool):
     PROFILE_DIR.mkdir(exist_ok=True)
-    launch_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--disable-features=IsolateOrigins,site-per-process",
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--window-size=1920,1080",
-    ]
-    kwargs = {
+    base_kwargs = {
         "headless": not show,
-        "locale": "de-DE",
-        "timezone_id": "Europe/Berlin",
-        "viewport": {"width": 1920, "height": 1080},
-        "args": launch_args,
+        "no_viewport": True,
+        "args": ["--no-sandbox", "--disable-dev-shm-usage"] if sys.platform != "win32" else [],
     }
+
+    # Bevorzugten Browser probieren (auf Windows erst Chrome, dann Edge, dann Chromium)
+    channels = []
     if BROWSER_CHANNEL and BROWSER_CHANNEL != "chromium":
-        kwargs["channel"] = BROWSER_CHANNEL
-    try:
-        ctx = p.chromium.launch_persistent_context(str(PROFILE_DIR), **kwargs)
-    except Exception:
-        kwargs.pop("channel", None)
-        ctx = p.chromium.launch_persistent_context(str(PROFILE_DIR), **kwargs)
-    ctx.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
-    return ctx
+        channels.append(BROWSER_CHANNEL)
+    if sys.platform == "win32":
+        for ch in ("chrome", "msedge"):
+            if ch not in channels:
+                channels.append(ch)
+    channels.append(None)
+
+    last_err = None
+    for ch in channels:
+        kwargs = dict(base_kwargs)
+        if ch:
+            kwargs["channel"] = ch
+        try:
+            return p.chromium.launch_persistent_context(str(PROFILE_DIR), **kwargs)
+        except Exception as e:
+            last_err = e
+    raise last_err
 
 
 def fetch_offers(ctx, url: str, need_meta: bool = False):
@@ -420,7 +432,7 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
             if API_HINT in resp.url:
                 if resp.status == 200:
                     hits.append(resp)
-                elif resp.status in (403, 429):
+                elif resp.status in (400, 403, 429):
                     api_blocked = True
         except Exception:
             pass
@@ -430,14 +442,14 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
     meta = {}
     try:
         main = page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        if main is not None and main.status in (403, 429):
+        if main is not None and main.status in (400, 403, 429):
             blocked = True
 
         # Wartet geduldig auf Angebote; sucht Cookie-Banner auch in iframes (z. B. Sourcepoint)
         t0 = time.time()
         has_real_offers = False
         clicked_consent = False
-        while time.time() - t0 < WAIT_FOR_API_S:
+        while not blocked and (time.time() - t0 < WAIT_FOR_API_S):
             if api_blocked:
                 blocked = True
                 break
@@ -492,23 +504,24 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
                 pass
 
         rating, rec, count = "", "", ""
-        try:
-            rating, rec, count = page.evaluate(r"""() => {
-                let ratingText = "", recText = "", countText = "";
-                const reviewBar = document.querySelector('[data-trackid="hotel-review-bar"]') || document.querySelector('.HotelReviewBar');
-                if (reviewBar) {
-                    const text = reviewBar.innerText;
-                    const recMatch = text.match(/(\d{2,3})\s*%/);
-                    if (recMatch) recText = recMatch[1];
-                    const sunMatch = text.match(/([0-9][.,][0-9])\s*\/\s*6/);
-                    if (sunMatch) ratingText = sunMatch[1].replace(',', '.');
-                    const countMatch = text.match(/([\d.]+)\s*Bewertungen/i);
-                    if (countMatch) countText = countMatch[1].replace(/\./g, '');
-                }
-                return [ratingText, recText, countText];
-            }""")
-        except Exception:
-            pass
+        if not blocked:
+            try:
+                rating, rec, count = page.evaluate(r"""() => {
+                    let ratingText = "", recText = "", countText = "";
+                    const reviewBar = document.querySelector('[data-trackid="hotel-review-bar"]') || document.querySelector('.HotelReviewBar');
+                    if (reviewBar) {
+                        const text = reviewBar.innerText;
+                        const recMatch = text.match(/(\d{2,3})\s*%/);
+                        if (recMatch) recText = recMatch[1];
+                        const sunMatch = text.match(/([0-9][.,][0-9])\s*\/\s*6/);
+                        if (sunMatch) ratingText = sunMatch[1].replace(',', '.');
+                        const countMatch = text.match(/([\d.]+)\s*Bewertungen/i);
+                        if (countMatch) countText = countMatch[1].replace(/\./g, '');
+                    }
+                    return [ratingText, recText, countText];
+                }""")
+            except Exception:
+                pass
 
         if need_meta and not blocked:
             try:
@@ -651,7 +664,7 @@ def verify_webhook_and_push_images(hotels: list[dict]) -> bool:
 
 # ------------------------------ Modi -----------------------------------------
 def mode_setup():
-    from playwright.sync_api import sync_playwright
+    sync_playwright = get_sync_playwright()
     with sync_playwright() as p:
         ctx = open_context(p, show=True)
         page = ctx.new_page()
@@ -661,7 +674,7 @@ def mode_setup():
 
 
 def mode_probe(hotels, show: bool):
-    from playwright.sync_api import sync_playwright
+    sync_playwright = get_sync_playwright()
     h = hotels[0]
     print(f"PROBE mit: {h['name']}\n{h['scrape_url']}\n")
     with sync_playwright() as p:
@@ -681,7 +694,7 @@ def mode_probe(hotels, show: bool):
 
 
 def mode_run(hotels, show: bool) -> int:
-    from playwright.sync_api import sync_playwright
+    sync_playwright = get_sync_playwright()
 
     if not verify_webhook_and_push_images(hotels):
         print("ABBRUCH VOR START: Bitte Google Apps Script als 'Neue Version' bereitstellen!")
