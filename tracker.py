@@ -5,10 +5,10 @@ HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Stealth/Xvfb)
 - Flexibles Urlaubsfenster: 14.06.2027 - 28.06.2027 (7 Tage, Abflug FMO).
 - Automatischer Check auf bekannten RU-Fokus für russische Hotelketten.
 - Stabilitäts- & Diagnose-Update:
-  * Kein veralteter Chrome-124-User-Agent mehr (verhindert Akamai-Fingerprint-Konflikt)
-  * Stylesheets bleiben erlaubt, Cookie-Banner wird bei Bedarf automatisch geklickt
+  * Kein künstliches Blockieren von Bildern/Fonts/CSS (verhindert Akamai-/Consent-Störungen)
+  * Cookie-Banner wird auch innerhalb von iframes (z. B. Sourcepoint) automatisch geklickt
   * Erkennt API-Blockaden (403/429) direkt statt fälschlich 'no_response' zu melden
-  * Gibt beim ersten Fehlschlag gesehene API-URLs/Statuscodes zur Diagnose im Log aus
+  * Gibt beim ersten Fehlschlag URL, Seitentitel, Frames, Seitentext & gesehene APIs im Log aus
 """
 import argparse
 import csv
@@ -407,15 +407,6 @@ def open_context(p, show: bool):
 def fetch_offers(ctx, url: str, need_meta: bool = False):
     page = ctx.new_page()
     hits, seen = [], []
-
-    def route_intercept(route):
-        # Stylesheets NICHT mehr blocken – nur schwere Medien abbrechen
-        if route.request.resource_type in ("image", "media", "font"):
-            route.abort()
-        else:
-            route.continue_()
-    page.route("**/*", route_intercept)
-
     api_blocked = False
 
     def on_response(resp):
@@ -442,7 +433,7 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
         if main is not None and main.status in (403, 429):
             blocked = True
 
-        # Wartet geduldig auf Angebote; versucht nach 5s ggf. ein Cookie-Banner zu schließen
+        # Wartet geduldig auf Angebote; sucht Cookie-Banner auch in iframes (z. B. Sourcepoint)
         t0 = time.time()
         has_real_offers = False
         clicked_consent = False
@@ -450,16 +441,18 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
             if api_blocked:
                 blocked = True
                 break
-            if not clicked_consent and not hits and (time.time() - t0) >= 5:
+            if not clicked_consent and not hits and (time.time() - t0) >= 4:
                 clicked_consent = True
-                try:
-                    btn = page.locator(
-                        'button:has-text("Alle akzeptieren"), button:has-text("Akzeptieren"), button:has-text("Zustimmen")'
-                    ).first
-                    if btn.is_visible(timeout=1500):
-                        btn.click(timeout=2000)
-                except Exception:
-                    pass
+                for frame in page.frames:
+                    try:
+                        btn = frame.locator(
+                            'button:has-text("Alle akzeptieren"), button:has-text("Akzeptieren"), button:has-text("Zustimmen"), button:has-text("Einverstanden")'
+                        ).first
+                        if btn.is_visible(timeout=1000):
+                            btn.click(timeout=2000)
+                            break
+                    except Exception:
+                        pass
             for r in list(hits):
                 try:
                     data = r.json()
@@ -476,6 +469,20 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
 
         if not hits and re.search(r"access denied|zugriff verweigert|robot|captcha", page.title() or "", re.I):
             blocked = True
+
+        # Falls weiterhin nichts ankam: ganz vorne in 'seen' zeigen, was der Browser tatsächlich sieht
+        if not hits:
+            try:
+                body_preview = re.sub(
+                    r"\s+", " ", page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+                )[:250]
+            except Exception:
+                body_preview = ""
+            frame_urls = [f.url for f in page.frames if f.url and f.url != page.url][:3]
+            seen.insert(0, (
+                main.status if main else None,
+                f"URL={page.url} | TITLE={page.title()} | FRAMES={frame_urls} | TEXT={body_preview}",
+            ))
 
         payloads = []
         for r in hits:
