@@ -4,7 +4,11 @@ HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Stealth/Xvfb)
 
 - Flexibles Urlaubsfenster: 14.06.2027 - 28.06.2027 (7 Tage, Abflug FMO).
 - Automatischer Check auf bekannten RU-Fokus für russische Hotelketten.
-- Stabilitäts-Update für GitHub Actions (Chromium-Fallback, Polling auf echte Angebote, Crash-Recovery).
+- Stabilitäts- & Diagnose-Update:
+  * Kein veralteter Chrome-124-User-Agent mehr (verhindert Akamai-Fingerprint-Konflikt)
+  * Stylesheets bleiben erlaubt, Cookie-Banner wird bei Bedarf automatisch geklickt
+  * Erkennt API-Blockaden (403/429) direkt statt fälschlich 'no_response' zu melden
+  * Gibt beim ersten Fehlschlag gesehene API-URLs/Statuscodes zur Diagnose im Log aus
 """
 import argparse
 import csv
@@ -24,9 +28,11 @@ from urllib.parse import urlparse
 import requests
 
 # ----------------------------- KONFIGURATION ---------------------------------
-SHEET_ID = os.getenv("SHEET_ID") or "1MG0UwMZbmFoSxCdVp8pqspM5wgtgQlJGyoVesRXd5ag"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL") or "https://script.google.com/macros/s/AKfycbxKwYhOMuEiqTidrqelTaVWpV4XpneyyHrKqHPqY5JSWjGFG_SFMrhi4Ms1axiiPyoaiA/exec"
-WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN") or "123456789"
+# In GitHub Actions werden diese Werte automatisch aus den Repository-Secrets geladen.
+# Für lokale Tests auf dem eigenen PC ohne Umgebungsvariablen ggf. nach dem "or" eintragen.
+SHEET_ID = (os.getenv("SHEET_ID") or "").strip()
+WEBHOOK_URL = (os.getenv("WEBHOOK_URL") or "").strip()
+WEBHOOK_TOKEN = (os.getenv("WEBHOOK_TOKEN") or "123456789").strip()
 
 # Auf Windows standardmäßig msedge, auf Linux (GitHub Actions) chromium nutzen
 DEFAULT_CHANNEL = "msedge" if sys.platform == "win32" else "chromium"
@@ -51,6 +57,13 @@ DEBUG_DIR = BASE / "debug"
 BACKUP_CSV = BASE / "preishistorie_backup.csv"
 
 UUID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
+
+RU_CHAINS = [
+    "rixos", "granada", "orange county", "justiniano", "lonicera", "dobedan",
+    "alva donna", "kaya", "papillon", "aska", "utopia", "transatlantik",
+    "mirage park", "asteria", "limak", "crystal", "fame residence", "nirvana",
+    "selectum", "sueno", "vonresort", "port nature", "sirene",
+]
 
 # ------------------------- Standort-Klassifizierung --------------------------
 SUB_LOCATIONS = [
@@ -220,6 +233,8 @@ def load_hotels(xlsx: str | None) -> list[dict]:
         head = [str(c).strip().lower() for c in rows[0]]
         recs = [dict(zip(head, r)) for r in rows[1:]]
     else:
+        if not SHEET_ID:
+            raise RuntimeError("SHEET_ID fehlt (weder Umgebungsvariable noch Fallback gesetzt).")
         r = requests.get(
             f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq",
             params={"tqx": "out:csv", "sheet": "hotels", "headers": 1},
@@ -376,7 +391,6 @@ def open_context(p, show: bool):
         "locale": "de-DE",
         "timezone_id": "Europe/Berlin",
         "viewport": {"width": 1920, "height": 1080},
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "args": launch_args,
     }
     if BROWSER_CHANNEL and BROWSER_CHANNEL != "chromium":
@@ -395,21 +409,28 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
     hits, seen = [], []
 
     def route_intercept(route):
-        if route.request.resource_type in ("image", "media", "font", "stylesheet"):
+        # Stylesheets NICHT mehr blocken – nur schwere Medien abbrechen
+        if route.request.resource_type in ("image", "media", "font"):
             route.abort()
         else:
             route.continue_()
     page.route("**/*", route_intercept)
 
+    api_blocked = False
+
     def on_response(resp):
+        nonlocal api_blocked
         try:
             if resp.request.resource_type not in ("xhr", "fetch"):
                 return
             ctype = (resp.headers.get("content-type") or "").lower()
-            if "json" in ctype:
+            if "json" in ctype or API_HINT in resp.url or "offer" in resp.url.lower():
                 seen.append((resp.status, resp.url))
-            if API_HINT in resp.url and resp.status == 200:
-                hits.append(resp)
+            if API_HINT in resp.url:
+                if resp.status == 200:
+                    hits.append(resp)
+                elif resp.status in (403, 429):
+                    api_blocked = True
         except Exception:
             pass
 
@@ -421,10 +442,24 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
         if main is not None and main.status in (403, 429):
             blocked = True
 
-        # Wartet geduldig, bis tatsächlich Angebote im Datenstrom enthalten sind (max. WAIT_FOR_API_S)
+        # Wartet geduldig auf Angebote; versucht nach 5s ggf. ein Cookie-Banner zu schließen
         t0 = time.time()
         has_real_offers = False
+        clicked_consent = False
         while time.time() - t0 < WAIT_FOR_API_S:
+            if api_blocked:
+                blocked = True
+                break
+            if not clicked_consent and not hits and (time.time() - t0) >= 5:
+                clicked_consent = True
+                try:
+                    btn = page.locator(
+                        'button:has-text("Alle akzeptieren"), button:has-text("Akzeptieren"), button:has-text("Zustimmen")'
+                    ).first
+                    if btn.is_visible(timeout=1500):
+                        btn.click(timeout=2000)
+                except Exception:
+                    pass
             for r in list(hits):
                 try:
                     data = r.json()
@@ -439,7 +474,7 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
                 break
             page.wait_for_timeout(750)
 
-        if not hits and re.search(r"access denied|zugriff verweigert", page.title() or "", re.I):
+        if not hits and re.search(r"access denied|zugriff verweigert|robot|captcha", page.title() or "", re.I):
             blocked = True
 
         payloads = []
@@ -573,18 +608,18 @@ def flush_rows(buffer: list, updates_buffer: list) -> bool:
 
 
 def verify_webhook_and_push_images(hotels: list[dict]) -> bool:
+    if not WEBHOOK_URL:
+        print("ABBRUCH: WEBHOOK_URL fehlt!")
+        return False
+
     print(f"Teste Webhook-Verbindung ({WEBHOOK_URL[:55]}...) ...")
     initial_updates = []
-    
-    ru_chains = ["rixos", "granada", "orange county", "justiniano", "lonicera", "dobedan", "alva donna", "kaya", "papillon", "aska", "utopia", "transatlantik", "mirage park", "asteria", "limak", "crystal", "fame residence", "nirvana", "selectum", "sueno", "vonresort", "port nature", "sirene"]
-    
+
     for h in hotels:
         upd = dict(h["auto_update"])
-        
         if not h["has_ru_focus"]:
-            if any(chain in h["name"].lower() for chain in ru_chains):
+            if any(chain in h["name"].lower() for chain in RU_CHAINS):
                 upd["ru_focus"] = "TRUE"
-                
         if upd:
             upd["url"] = h["raw_url"]
             upd["name"] = h["name"]
@@ -627,6 +662,7 @@ def mode_probe(hotels, show: bool):
         payloads, blocked, seen, rating, rec, count, meta = fetch_offers(ctx, h["scrape_url"], need_meta=True)
         ctx.close()
     print(f"Blockiert: {blocked}")
+    print(f"Gesehene APIs ({len(seen)}): {seen[:10]}")
     print(f"Bewertung: {rating} / 6 | {rec}% | {count} Reviews")
     print(f"Erkannte Stammdaten: {meta}")
     price, details = extract_price(payloads)
@@ -651,8 +687,6 @@ def mode_run(hotels, show: bool) -> int:
     consecutive = 0
     aborted = False
     post_ok = True
-    
-    ru_chains = ["rixos", "granada", "orange county", "justiniano", "lonicera", "dobedan", "alva donna", "kaya", "papillon", "aska", "utopia", "transatlantik", "mirage park", "asteria", "limak", "crystal", "fame residence", "nirvana", "selectum", "sueno", "vonresort", "port nature", "sirene"]
 
     with sync_playwright() as p:
         ctx = open_context(p, show)
@@ -664,13 +698,13 @@ def mode_run(hotels, show: bool) -> int:
 
                 print(f"[{i}/{len(hotels)}] {name} ... ", end="", flush=True)
                 price, details, status = None, "", ""
-                payloads, blocked = [], False
+                payloads, blocked, seen = [], False, []
                 rating = rec = count = ""
                 meta = {}
 
                 for attempt in (1, 2):
                     try:
-                        payloads, blocked, _, rating, rec, count, meta = fetch_offers(
+                        payloads, blocked, seen, rating, rec, count, meta = fetch_offers(
                             ctx, scrape_url, need_meta=need_meta
                         )
                         price, details = extract_price(payloads)
@@ -681,7 +715,6 @@ def mode_run(hotels, show: bool) -> int:
                         payloads, blocked = [], False
                         err_msg = str(e).splitlines()[0][:80] if str(e) else ""
                         status = f"error:{type(e).__name__}({err_msg})"
-                        # Falls der Browser-Kontext abgestürzt ist, vor Versuch 2 frisch öffnen
                         try:
                             ctx.close()
                         except Exception:
@@ -706,9 +739,9 @@ def mode_run(hotels, show: bool) -> int:
                     upd["tags"] = meta["tags"]
                 if "image" not in upd and meta.get("og_image"):
                     upd["image"] = meta["og_image"]
-                    
+
                 if not h["has_ru_focus"]:
-                    if any(chain in name.lower() for chain in ru_chains):
+                    if any(chain in name.lower() for chain in RU_CHAINS):
                         upd["ru_focus"] = "TRUE"
 
                 if upd:
@@ -728,6 +761,8 @@ def mode_run(hotels, show: bool) -> int:
                     stats[status.split(":")[0]] += 1
                     consecutive = 0 if status == "no_offer" else consecutive + 1
                     print(status)
+                    if i == 1 and status in ("no_response", "blocked"):
+                        print("   ↳ DEBUG gesehen:", seen[:8])
 
                 append_backup([row])
                 buffer.append(row)
