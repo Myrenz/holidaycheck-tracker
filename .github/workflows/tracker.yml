@@ -2,6 +2,11 @@ name: HolidayCheck Tracker
 
 on:
   workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Anzahl Hotels zum Testen (0 = alle)'
+        required: false
+        default: '0'
   schedule:
     # Zeiten in UTC (Winterzeit in DE = UTC+1)
     - cron: '3 5 * * *'    # 06:03 Uhr DE
@@ -27,8 +32,8 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests playwright patchright openpyxl
-          playwright install --with-deps chromium
+          pip install requests patchright openpyxl
+          patchright install --with-deps chrome || patchright install --with-deps chromium
 
       - name: Start WireGuard VPN (Fritz!Box Namespace)
         env:
@@ -94,7 +99,6 @@ jobs:
           source /tmp/wg0_meta.env
           chmod 600 /tmp/wg0_pure.conf
 
-          # Isolierten Netzwerk-Namespace anlegen, damit GitHub Actions selbst nicht getrennt wird
           sudo ip netns del vpn 2>/dev/null || true
           sudo ip link del wg0 2>/dev/null || true
           sudo ip netns add vpn
@@ -102,14 +106,12 @@ jobs:
           sudo wg setconf wg0 /tmp/wg0_pure.conf
           rm -f /tmp/wg0_pure.conf /tmp/wg0_meta.env
 
-          # Tunnel-Interface in den Namespace verschieben (UDP-Socket bleibt auf dem Runner)
           sudo ip link set wg0 netns vpn
           sudo ip -n vpn link set lo up
           sudo ip -n vpn addr add "$WG_ADDR" dev wg0
           sudo ip -n vpn link set mtu 1280 up dev wg0
           sudo ip -n vpn route add default dev wg0
 
-          # Eigenes DNS nur für den VPN-Namespace setzen
           sudo mkdir -p /etc/netns/vpn
           printf "nameserver %s\nnameserver 1.1.1.1\noptions timeout:2 attempts:2\n" "$WG_DNS" | sudo tee /etc/netns/vpn/resolv.conf > /dev/null
 
@@ -127,17 +129,19 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
-          BROWSER_CHANNEL: chromium
+          BROWSER_CHANNEL: chrome
+          LIMIT: ${{ github.event.inputs.limit || '0' }}
         run: |
           PYTHON_BIN=$(which python)
           sudo ip netns exec vpn sudo -u "$USER" env \
             "PATH=$PATH" \
             "HOME=$HOME" \
+            "TZ=Europe/Berlin" \
             "SHEET_ID=$SHEET_ID" \
             "WEBHOOK_URL=$WEBHOOK_URL" \
             "WEBHOOK_TOKEN=$WEBHOOK_TOKEN" \
-            "BROWSER_CHANNEL=chromium" \
-            xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" "$PYTHON_BIN" -u tracker.py --show
+            "BROWSER_CHANNEL=chrome" \
+            xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" "$PYTHON_BIN" -u tracker.py --show --limit "$LIMIT"
 
       - name: Stop WireGuard VPN
         if: always()
