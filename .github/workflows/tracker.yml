@@ -27,7 +27,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests playwright openpyxl
+          pip install requests playwright patchright openpyxl
           playwright install --with-deps chromium
 
       - name: Start WireGuard VPN (Fritz!Box)
@@ -42,10 +42,11 @@ jobs:
           CLEAN_CFG=$(printf '%s\n' "$WIREGUARD_CONFIG" | tr -d '\r')
           WG_DNS=$(printf '%s\n' "$CLEAN_CFG" | grep -i '^[[:space:]]*DNS[[:space:]]*=' | head -n1 | cut -d'=' -f2- | tr ',' '\n' | grep -E '^[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+[[:space:]]*$' | head -n1 | tr -d ' ' || true)
 
+          # AllowedIPs erzwingt kompletten Internet-Traffic (0.0.0.0/0) über die FRITZ!Box
           printf '%s\n' "$CLEAN_CFG" \
-            | grep -viE '^[[:space:]]*(DNS|MTU)[[:space:]]*=' \
-            | sed -E 's/,?[[:space:]]*::\/0//g; s/=[[:space:]]*,/= /; s/,[[:space:]]*$//' \
+            | grep -viE '^[[:space:]]*(DNS|MTU|AllowedIPs)[[:space:]]*=' \
             | sed -E '/^[[:space:]]*\[Interface\]/a MTU = 1280' \
+            | sed -E '/^[[:space:]]*\[Peer\]/a AllowedIPs = 0.0.0.0/0' \
             | sudo tee /etc/wireguard/wg0.conf > /dev/null
           sudo chmod 600 /etc/wireguard/wg0.conf
 
