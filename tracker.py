@@ -4,11 +4,12 @@ HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Patchright-Stealth
 
 - Flexibles Urlaubsfenster: 14.06.2027 - 28.06.2027 (7 Tage, Abflug FMO).
 - Automatischer Check auf bekannten RU-Fokus für russische Hotelketten.
-- Patchright-Stealth-Update:
-  * Nutzt Patchright + echtes Google Chrome (entfernt Playwrights CDP-Bot-Signatur gegen Akamai)
-  * Wärmt ein frisches Profil auf holidaycheck.de auf (setzt Akamai-Cookies + akzeptiert Cookie-Banner)
-  * Erkennt Akamai-Sperrseiten (auch bei HTTP 200) und 400/403/429 sofort ohne 40s-Timeout
-  * Klickt Cookie-Banner auch innerhalb von iframes (z. B. Sourcepoint)
+- Patchright-Stealth & Rate-Limit-Update:
+  * Nutzt Patchright + echtes Google Chrome (entfernt Playwrights CDP-Bot-Signatur)
+  * Wärmt ein frisches Profil auf holidaycheck.de auf (setzt Akamai-Cookies + Consent)
+  * Ruhigeres Tempo + geplante Abkühlpause alle 25 Hotels gegen IP-Rate-Limits (429)
+  * Löscht bei Block/429 das alte Browser-Profil (verwirft geflaggte Akamai-Cookies)
+  * Eskalierende Abkühlpausen (75s -> 150s -> 240s -> 300s) + loggt den genauen Block-Grund
 """
 import argparse
 import csv
@@ -18,6 +19,7 @@ import json
 import os
 import random
 import re
+import shutil
 import sys
 import time
 import uuid
@@ -41,9 +43,10 @@ SEARCH_QUERY = "?_offer=adults:2,airport:~FMO,departureDate:2027-06-14,duration:
 # -----------------------------------------------------------------------------
 
 MIN_OK, MAX_OK = 1000, 20000
-PAUSE_HOTEL = (3, 6)
-PAUSE_BLOCK = (12, 20)
-MAX_CONSECUTIVE_FAILS = 15
+PAUSE_HOTEL = (5, 9)            # ruhigeres Tempo pro Hotel gegen Rate-Limits
+PAUSE_BATCH = (60, 90)          # geplante Abkühlpause nach jedem 25er-Paket
+BLOCK_COOLDOWNS = (75, 150, 240, 300)  # eskalierende Pause bei echtem Block/429
+MAX_CONSECUTIVE_FAILS = 6       # sauberer Abbruch nach 6 komplett blockierten Hotels in Folge
 WAIT_FOR_API_S = 40
 FLUSH_EVERY = 25
 POST_CHUNK = 100
@@ -401,6 +404,11 @@ def click_consent_if_present(page) -> bool:
     return False
 
 
+def reset_profile() -> None:
+    """Löscht gespeicherte Browser-Cookies/Profil, damit geflaggte Akamai-Sessions verworfen werden."""
+    shutil.rmtree(PROFILE_DIR, ignore_errors=True)
+
+
 def open_context(p, show: bool):
     PROFILE_DIR.mkdir(exist_ok=True)
     args = ["--lang=de-DE"]
@@ -458,10 +466,10 @@ def warmup_session(ctx) -> None:
 def fetch_offers(ctx, url: str, need_meta: bool = False):
     page = ctx.new_page()
     hits, seen = [], []
-    api_blocked = False
+    api_blocked_status = None
 
     def on_response(resp):
-        nonlocal api_blocked
+        nonlocal api_blocked_status
         try:
             if resp.request.resource_type not in ("xhr", "fetch"):
                 return
@@ -472,25 +480,28 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
                 if resp.status == 200:
                     hits.append(resp)
                 elif resp.status in (400, 403, 429):
-                    api_blocked = True
+                    api_blocked_status = resp.status
         except Exception:
             pass
 
     page.on("response", on_response)
     blocked = False
+    block_reason = ""
     meta = {}
     try:
         main = page.goto(url, wait_until="domcontentloaded", timeout=60_000)
         if main is not None and main.status in (400, 403, 429):
             blocked = True
+            block_reason = f"page:{main.status}"
 
         t0 = time.time()
         has_real_offers = False
         clicked_consent = False
         checked_block_text = False
         while not blocked and (time.time() - t0 < WAIT_FOR_API_S):
-            if api_blocked:
+            if api_blocked_status is not None:
                 blocked = True
+                block_reason = f"api:{api_blocked_status}"
                 break
             if not checked_block_text and not hits and (time.time() - t0) >= 2.5:
                 checked_block_text = True
@@ -498,6 +509,7 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
                     txt = page.evaluate("() => document.body ? document.body.innerText.slice(0, 600) : ''") or ""
                     if BLOCK_TEXT_RE.search(txt):
                         blocked = True
+                        block_reason = "akamai-page"
                         break
                 except Exception:
                     pass
@@ -520,6 +532,7 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
 
         if not hits and re.search(r"access denied|zugriff verweigert|robot|captcha", page.title() or "", re.I):
             blocked = True
+            block_reason = block_reason or "title-block"
 
         if not hits:
             try:
@@ -528,6 +541,7 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
                 )[:250]
                 if BLOCK_TEXT_RE.search(body_preview):
                     blocked = True
+                    block_reason = block_reason or "akamai-page"
             except Exception:
                 body_preview = ""
             frame_urls = [f.url for f in page.frames if f.url and f.url != page.url][:3]
@@ -618,7 +632,7 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
             except Exception:
                 pass
 
-        return payloads, blocked, seen, rating, rec, count, meta
+        return payloads, blocked, block_reason, seen, rating, rec, count, meta
     finally:
         try:
             page.close()
@@ -720,9 +734,9 @@ def mode_probe(hotels, show: bool):
     with sync_playwright() as p:
         ctx = open_context(p, show)
         warmup_session(ctx)
-        payloads, blocked, seen, rating, rec, count, meta = fetch_offers(ctx, h["scrape_url"], need_meta=True)
+        payloads, blocked, block_reason, seen, rating, rec, count, meta = fetch_offers(ctx, h["scrape_url"], need_meta=True)
         ctx.close()
-    print(f"Blockiert: {blocked}")
+    print(f"Blockiert: {blocked} ({block_reason})")
     print(f"Gesehene APIs ({len(seen)}): {seen[:10]}")
     print(f"Bewertung: {rating} / 6 | {rec}% | {count} Reviews")
     print(f"Erkannte Stammdaten: {meta}")
@@ -746,6 +760,7 @@ def mode_run(hotels, show: bool) -> int:
     updates_buffer: list = []
     stats: dict = defaultdict(int)
     consecutive = 0
+    block_level = 0
     aborted = False
     post_ok = True
 
@@ -760,40 +775,49 @@ def mode_run(hotels, show: bool) -> int:
 
                 print(f"[{i}/{len(hotels)}] {name} ... ", end="", flush=True)
                 price, details, status = None, "", ""
-                payloads, blocked, seen = [], False, []
+                payloads, blocked, block_reason, seen = [], False, "", []
                 rating = rec = count = ""
                 meta = {}
 
                 for attempt in (1, 2):
                     try:
-                        payloads, blocked, seen, rating, rec, count, meta = fetch_offers(
+                        payloads, blocked, block_reason, seen, rating, rec, count, meta = fetch_offers(
                             ctx, scrape_url, need_meta=need_meta
                         )
                         price, details = extract_price(payloads)
                         status = ""
                         if price is not None:
+                            block_level = 0
                             break
                         if blocked:
-                            try:
-                                ctx.close()
-                            except Exception:
-                                pass
-                            time.sleep(random.uniform(*PAUSE_BLOCK))
-                            ctx = open_context(p, show)
-                            warmup_session(ctx)
+                            wait_s = BLOCK_COOLDOWNS[min(block_level, len(BLOCK_COOLDOWNS) - 1)] + random.randint(0, 20)
+                            block_level += 1
+                            if attempt == 1:
+                                print(f"\n   ↳ Block erkannt ({block_reason or 'unbekannt'}) – lösche Profil & kühle {wait_s}s ab ...", flush=True)
+                                try:
+                                    ctx.close()
+                                except Exception:
+                                    pass
+                                reset_profile()
+                                time.sleep(wait_s)
+                                ctx = open_context(p, show)
+                                warmup_session(ctx)
+                                print(f"   ↳ Wiederhole [{i}/{len(hotels)}] {name} ... ", end="", flush=True)
+                            else:
+                                break
+                        elif attempt == 1:
+                            time.sleep(random.uniform(4, 7))
                     except Exception as e:
-                        payloads, blocked = [], False
+                        payloads, blocked, block_reason = [], False, ""
                         err_msg = str(e).splitlines()[0][:80] if str(e) else ""
                         status = f"error:{type(e).__name__}({err_msg})"
                         try:
                             ctx.close()
                         except Exception:
                             pass
-                        time.sleep(random.uniform(*PAUSE_BLOCK))
+                        time.sleep(random.uniform(10, 15))
                         ctx = open_context(p, show)
                         warmup_session(ctx)
-                    if attempt == 1:
-                        time.sleep(random.uniform(3, 6))
 
                 upd = dict(h["auto_update"])
                 if not h["has_name"] and meta.get("name"):
@@ -830,9 +854,10 @@ def mode_run(hotels, show: bool) -> int:
                     row = [ts, name, "", build_details(f"status={status}", rating, rec, count)]
                     stats[status.split(":")[0]] += 1
                     consecutive = 0 if status == "no_offer" else consecutive + 1
-                    print(status)
-                    if i == 1 and status in ("no_response", "blocked"):
-                        print("   ↳ DEBUG gesehen:", seen[:8])
+                    reason_info = f" ({block_reason})" if block_reason else ""
+                    print(f"{status}{reason_info}")
+                    if consecutive == 1 and status in ("no_response", "blocked"):
+                        print("   ↳ DEBUG gesehen:", seen[:6])
 
                 append_backup([row])
                 buffer.append(row)
@@ -842,10 +867,27 @@ def mode_run(hotels, show: bool) -> int:
                     aborted = True
                     break
 
-                time.sleep(random.uniform(*PAUSE_HOTEL))
+                # Bei anhaltendem Block vor dem nächsten Hotel direkt nochmal abkühlen & Profil leeren
+                if blocked and consecutive > 0:
+                    wait_s = BLOCK_COOLDOWNS[min(block_level, len(BLOCK_COOLDOWNS) - 1)] + random.randint(0, 20)
+                    print(f"   ↳ Zusätzliche Abkühlpause ({wait_s}s) + frisches Profil vor nächstem Hotel ...")
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
+                    reset_profile()
+                    time.sleep(wait_s)
+                    ctx = open_context(p, show)
+                    warmup_session(ctx)
+                else:
+                    time.sleep(random.uniform(*PAUSE_HOTEL))
+
                 if i % FLUSH_EVERY == 0:
                     post_ok = flush_rows(buffer, updates_buffer) and post_ok
-                    time.sleep(random.uniform(*PAUSE_BLOCK))
+                    if i < len(hotels):
+                        batch_wait = random.uniform(*PAUSE_BATCH)
+                        print(f"   ↳ Geplante Rate-Limit-Pause nach {i} Hotels ({batch_wait:.0f}s) ...")
+                        time.sleep(batch_wait)
         finally:
             try:
                 ctx.close()
