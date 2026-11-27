@@ -709,4 +709,178 @@ def mode_setup():
         ctx = open_context(p, show=True)
         page = ctx.new_page()
         page.goto("https://www.holidaycheck.de/", timeout=60_000)
-        input("Cookie
+        input("Cookie-Banner bestätigen. Dann hier ENTER drücken ... ")
+        ctx.close()
+
+
+def mode_probe(hotels, show: bool):
+    sync_playwright = get_sync_playwright()
+    h = hotels[0]
+    print(f"PROBE mit: {h['name']}\n{h['scrape_url']}\n")
+    with sync_playwright() as p:
+        ctx = open_context(p, show)
+        warmup_session(ctx)
+        payloads, blocked, seen, rating, rec, count, meta = fetch_offers(ctx, h["scrape_url"], need_meta=True)
+        ctx.close()
+    print(f"Blockiert: {blocked}")
+    print(f"Gesehene APIs ({len(seen)}): {seen[:10]}")
+    print(f"Bewertung: {rating} / 6 | {rec}% | {count} Reviews")
+    print(f"Erkannte Stammdaten: {meta}")
+    price, details = extract_price(payloads)
+    print(f"Preis (extract_price): {price} [{details}] | Status: {classify_failure(payloads, blocked) if price is None else 'ok'}")
+    DEBUG_DIR.mkdir(exist_ok=True)
+    out = DEBUG_DIR / "probe_payloads.json"
+    out.write_text(json.dumps(payloads, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Rohdaten gespeichert: {out} ({len(payloads)} API-Antworten)")
+
+
+def mode_run(hotels, show: bool) -> int:
+    sync_playwright = get_sync_playwright()
+
+    if not verify_webhook_and_push_images(hotels):
+        print("ABBRUCH VOR START: Bitte Google Apps Script als 'Neue Version' bereitstellen!")
+        return 2
+
+    ts = berlin_now().strftime("%Y-%m-%d %H:%M")
+    buffer: list = []
+    updates_buffer: list = []
+    stats: dict = defaultdict(int)
+    consecutive = 0
+    aborted = False
+    post_ok = True
+
+    with sync_playwright() as p:
+        ctx = open_context(p, show)
+        warmup_session(ctx)
+        try:
+            for i, h in enumerate(hotels, 1):
+                name = h["name"]
+                scrape_url = h["scrape_url"]
+                need_meta = h["need_page_meta"]
+
+                print(f"[{i}/{len(hotels)}] {name} ... ", end="", flush=True)
+                price, details, status = None, "", ""
+                payloads, blocked, seen = [], False, []
+                rating = rec = count = ""
+                meta = {}
+
+                for attempt in (1, 2):
+                    try:
+                        payloads, blocked, seen, rating, rec, count, meta = fetch_offers(
+                            ctx, scrape_url, need_meta=need_meta
+                        )
+                        price, details = extract_price(payloads)
+                        status = ""
+                        if price is not None:
+                            break
+                        if blocked:
+                            try:
+                                ctx.close()
+                            except Exception:
+                                pass
+                            time.sleep(random.uniform(*PAUSE_BLOCK))
+                            ctx = open_context(p, show)
+                            warmup_session(ctx)
+                    except Exception as e:
+                        payloads, blocked = [], False
+                        err_msg = str(e).splitlines()[0][:80] if str(e) else ""
+                        status = f"error:{type(e).__name__}({err_msg})"
+                        try:
+                            ctx.close()
+                        except Exception:
+                            pass
+                        time.sleep(random.uniform(*PAUSE_BLOCK))
+                        ctx = open_context(p, show)
+                        warmup_session(ctx)
+                    if attempt == 1:
+                        time.sleep(random.uniform(3, 6))
+
+                upd = dict(h["auto_update"])
+                if not h["has_name"] and meta.get("name"):
+                    name = meta["name"]
+                    upd["name"] = name
+                if not h["has_region"] and meta.get("region"):
+                    upd["region"] = meta["region"]
+                if not h["has_ort"] and meta.get("ort"):
+                    upd["ort"] = meta["ort"]
+                if not h["has_stars"] and meta.get("stars"):
+                    upd["stars"] = meta["stars"]
+                if not h["has_tags"] and meta.get("tags"):
+                    upd["tags"] = meta["tags"]
+                if "image" not in upd and meta.get("og_image"):
+                    upd["image"] = meta["og_image"]
+
+                if not h["has_ru_focus"]:
+                    if any(chain in name.lower() for chain in RU_CHAINS):
+                        upd["ru_focus"] = "TRUE"
+
+                if upd:
+                    upd["url"] = h["raw_url"]
+                    if not upd.get("name"):
+                        upd["name"] = name
+                    updates_buffer.append(upd)
+
+                if price is not None:
+                    row = [ts, name, price, build_details(details, rating, rec, count)]
+                    stats["ok"] += 1
+                    consecutive = 0
+                    print(f"{price:.2f} EUR")
+                else:
+                    status = status or classify_failure(payloads, blocked)
+                    row = [ts, name, "", build_details(f"status={status}", rating, rec, count)]
+                    stats[status.split(":")[0]] += 1
+                    consecutive = 0 if status == "no_offer" else consecutive + 1
+                    print(status)
+                    if i == 1 and status in ("no_response", "blocked"):
+                        print("   ↳ DEBUG gesehen:", seen[:8])
+
+                append_backup([row])
+                buffer.append(row)
+
+                if consecutive >= MAX_CONSECUTIVE_FAILS:
+                    print(f"\nAbbruch: {consecutive} Fehlschläge in Folge")
+                    aborted = True
+                    break
+
+                time.sleep(random.uniform(*PAUSE_HOTEL))
+                if i % FLUSH_EVERY == 0:
+                    post_ok = flush_rows(buffer, updates_buffer) and post_ok
+                    time.sleep(random.uniform(*PAUSE_BLOCK))
+        finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+    post_ok = flush_rows(buffer, updates_buffer) and post_ok
+    print("\nZusammenfassung:", dict(stats))
+    if not post_ok:
+        print(f"Webhook-Versand unvollständig – alle Zeilen liegen in {BACKUP_CSV}")
+        return 2
+    if aborted:
+        return 3
+    return 0 if stats["ok"] > 0 else 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--setup", action="store_true")
+    ap.add_argument("--probe", action="store_true")
+    ap.add_argument("--show", action="store_true")
+    ap.add_argument("--limit", type=int, default=0)
+    args, _ = ap.parse_known_args()
+
+    if args.setup:
+        return mode_setup() or 0
+    hotels = load_hotels(None)
+    if args.limit:
+        hotels = hotels[: args.limit]
+    if not hotels:
+        return 1
+    if args.probe:
+        return mode_probe(hotels, args.show) or 0
+    return mode_run(hotels, args.show)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
