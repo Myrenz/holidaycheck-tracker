@@ -4,12 +4,11 @@ HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Patchright-Stealth
 
 - Flexibles Urlaubsfenster: 14.06.2027 - 28.06.2027 (7 Tage, Abflug FMO).
 - Automatischer Check auf bekannten RU-Fokus für russische Hotelketten.
-- Patchright-Stealth & Rate-Limit-Update:
+- Stabilitäts- & Anti-Block-Update:
   * Nutzt Patchright + echtes Google Chrome (entfernt Playwrights CDP-Bot-Signatur)
-  * Wärmt ein frisches Profil auf holidaycheck.de auf (setzt Akamai-Cookies + Consent)
-  * Ruhigeres Tempo + geplante Abkühlpause alle 25 Hotels gegen IP-Rate-Limits (429)
-  * Löscht bei Block/429 das alte Browser-Profil (verwirft geflaggte Akamai-Cookies)
-  * Eskalierende Abkühlpausen (75s -> 150s -> 240s -> 300s) + loggt den genauen Block-Grund
+  * Proaktive Session-Rotation alle 25 Hotels (umgeht das ~40-Hotel-Akamai-Limit komplett)
+  * Wandelt /hi/-Infoseiten-Links automatisch in /ho/angebote-.../package um
+  * Löscht bei Block/429 das alte Browser-Profil und legt gestaffelte Abkühlpausen ein
 """
 import argparse
 import csv
@@ -43,10 +42,10 @@ SEARCH_QUERY = "?_offer=adults:2,airport:~FMO,departureDate:2027-06-14,duration:
 # -----------------------------------------------------------------------------
 
 MIN_OK, MAX_OK = 1000, 20000
-PAUSE_HOTEL = (5, 9)            # ruhigeres Tempo pro Hotel gegen Rate-Limits
-PAUSE_BATCH = (60, 90)          # geplante Abkühlpause nach jedem 25er-Paket
-BLOCK_COOLDOWNS = (75, 150, 240, 300)  # eskalierende Pause bei echtem Block/429
-MAX_CONSECUTIVE_FAILS = 6       # sauberer Abbruch nach 6 komplett blockierten Hotels in Folge
+PAUSE_HOTEL = (3.5, 6.5)               # zügiges, aber ruhiges Tempo pro Hotel
+PAUSE_BATCH = (35, 50)                 # Pause + proaktiver Profil-Reset alle 25 Hotels
+BLOCK_COOLDOWNS = (75, 130, 210)       # gestaffelte Pause bei unerwartetem Block
+MAX_CONSECUTIVE_FAILS = 6              # sauberer Abbruch nach 6 Fehlschlägen in Folge
 WAIT_FOR_API_S = 40
 FLUSH_EVERY = 25
 POST_CHUNK = 100
@@ -57,6 +56,10 @@ DEBUG_DIR = BASE / "debug"
 BACKUP_CSV = BASE / "preishistorie_backup.csv"
 
 UUID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
+HI_URL_RE = re.compile(
+    r"^(https?://[^/]+)/hi/([^/]+)/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
+    re.I,
+)
 BLOCK_TEXT_RE = re.compile(
     r"diese funktionalität steht gerade nicht zur verfügung|access denied|zugriff verweigert|bitte kontaktieren sie unseren support mit dieser referenz",
     re.I,
@@ -214,6 +217,16 @@ def fallback_name_from_url(url: str) -> str:
     return "Neues Hotel"
 
 
+def normalize_offer_url(raw_url: str) -> str:
+    """Wandelt /hi/<slug>/<uuid> automatisch in die Angebotsseite /ho/angebote-<slug>/<uuid>/package um."""
+    base_url = raw_url.split("?")[0].rstrip("/")
+    m_hi = HI_URL_RE.match(base_url)
+    if m_hi:
+        host, slug, hc_uuid = m_hi.groups()
+        base_url = f"{host}/ho/angebote-{slug}/{hc_uuid}/package"
+    return base_url + SEARCH_QUERY
+
+
 # ------------------------------ Zeit -----------------------------------------
 def _last_sunday(year: int, month: int) -> dt.date:
     d = dt.date(year, month, 31)
@@ -268,7 +281,7 @@ def load_hotels(xlsx: str | None) -> list[dict]:
         ru_focus = str(x.get("ru_focus") or "").strip()
 
         base_url = raw_url.split("?")[0].rstrip("/")
-        scrape_url = base_url + SEARCH_QUERY
+        scrape_url = normalize_offer_url(raw_url)
 
         m_uuid = UUID_RE.search(base_url)
         hc_uuid = m_uuid.group(1).lower() if m_uuid else ""
@@ -405,7 +418,7 @@ def click_consent_if_present(page) -> bool:
 
 
 def reset_profile() -> None:
-    """Löscht gespeicherte Browser-Cookies/Profil, damit geflaggte Akamai-Sessions verworfen werden."""
+    """Löscht gespeicherte Browser-Cookies/Profil, damit Akamai-Sessions sauber zurückgesetzt werden."""
     shutil.rmtree(PROFILE_DIR, ignore_errors=True)
 
 
@@ -461,6 +474,21 @@ def warmup_session(ctx) -> None:
             page.close()
         except Exception:
             pass
+
+
+def rotate_browser(p, ctx, show: bool, wait_s: float, reason: str):
+    """Schließt Browser, löscht Profil, wartet ab und startet eine frische Session."""
+    print(f"   ↳ {reason} ({wait_s:.0f}s Pause + frisches Profil) ...", flush=True)
+    if ctx is not None:
+        try:
+            ctx.close()
+        except Exception:
+            pass
+    reset_profile()
+    time.sleep(wait_s)
+    new_ctx = open_context(p, show)
+    warmup_session(new_ctx)
+    return new_ctx
 
 
 def fetch_offers(ctx, url: str, need_meta: bool = False):
@@ -790,34 +818,22 @@ def mode_run(hotels, show: bool) -> int:
                             block_level = 0
                             break
                         if blocked:
-                            wait_s = BLOCK_COOLDOWNS[min(block_level, len(BLOCK_COOLDOWNS) - 1)] + random.randint(0, 20)
+                            wait_s = BLOCK_COOLDOWNS[min(block_level, len(BLOCK_COOLDOWNS) - 1)] + random.randint(0, 15)
                             block_level += 1
                             if attempt == 1:
-                                print(f"\n   ↳ Block erkannt ({block_reason or 'unbekannt'}) – lösche Profil & kühle {wait_s}s ab ...", flush=True)
-                                try:
-                                    ctx.close()
-                                except Exception:
-                                    pass
-                                reset_profile()
-                                time.sleep(wait_s)
-                                ctx = open_context(p, show)
-                                warmup_session(ctx)
+                                print("")
+                                ctx = rotate_browser(p, ctx, show, wait_s, f"Block erkannt ({block_reason or 'unbekannt'})")
                                 print(f"   ↳ Wiederhole [{i}/{len(hotels)}] {name} ... ", end="", flush=True)
                             else:
                                 break
                         elif attempt == 1:
-                            time.sleep(random.uniform(4, 7))
+                            time.sleep(random.uniform(3, 5))
                     except Exception as e:
                         payloads, blocked, block_reason = [], False, ""
                         err_msg = str(e).splitlines()[0][:80] if str(e) else ""
                         status = f"error:{type(e).__name__}({err_msg})"
-                        try:
-                            ctx.close()
-                        except Exception:
-                            pass
-                        time.sleep(random.uniform(10, 15))
-                        ctx = open_context(p, show)
-                        warmup_session(ctx)
+                        print("")
+                        ctx = rotate_browser(p, ctx, show, random.uniform(10, 15), f"Browser-Neustart nach {type(e).__name__}")
 
                 upd = dict(h["auto_update"])
                 if not h["has_name"] and meta.get("name"):
@@ -867,27 +883,18 @@ def mode_run(hotels, show: bool) -> int:
                     aborted = True
                     break
 
-                # Bei anhaltendem Block vor dem nächsten Hotel direkt nochmal abkühlen & Profil leeren
-                if blocked and consecutive > 0:
-                    wait_s = BLOCK_COOLDOWNS[min(block_level, len(BLOCK_COOLDOWNS) - 1)] + random.randint(0, 20)
-                    print(f"   ↳ Zusätzliche Abkühlpause ({wait_s}s) + frisches Profil vor nächstem Hotel ...")
-                    try:
-                        ctx.close()
-                    except Exception:
-                        pass
-                    reset_profile()
-                    time.sleep(wait_s)
-                    ctx = open_context(p, show)
-                    warmup_session(ctx)
-                else:
-                    time.sleep(random.uniform(*PAUSE_HOTEL))
-
                 if i % FLUSH_EVERY == 0:
                     post_ok = flush_rows(buffer, updates_buffer) and post_ok
                     if i < len(hotels):
+                        # Proaktive Session-Rotation alle 25 Hotels (vor dem ~40-Hotel-Akamai-Limit)
                         batch_wait = random.uniform(*PAUSE_BATCH)
-                        print(f"   ↳ Geplante Rate-Limit-Pause nach {i} Hotels ({batch_wait:.0f}s) ...")
-                        time.sleep(batch_wait)
+                        ctx = rotate_browser(p, ctx, show, batch_wait, f"Proaktive Session-Rotation nach {i} Hotels")
+                        block_level = 0
+                elif blocked and consecutive > 0:
+                    wait_s = BLOCK_COOLDOWNS[min(block_level, len(BLOCK_COOLDOWNS) - 1)] + random.randint(0, 15)
+                    ctx = rotate_browser(p, ctx, show, wait_s, "Abkühlpause vor nächstem Hotel")
+                else:
+                    time.sleep(random.uniform(*PAUSE_HOTEL))
         finally:
             try:
                 ctx.close()
