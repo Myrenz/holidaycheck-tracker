@@ -30,42 +30,94 @@ jobs:
           pip install requests playwright patchright openpyxl
           playwright install --with-deps chromium
 
-      - name: Start WireGuard VPN (Fritz!Box)
+      - name: Start WireGuard VPN (Fritz!Box Namespace)
         env:
           WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
         run: |
-          echo "127.0.0.1 $(hostname)" | sudo tee -a /etc/hosts > /dev/null
-
           sudo apt-get update -qq
-          sudo apt-get install -y -qq wireguard-tools
-
-          CLEAN_CFG=$(printf '%s\n' "$WIREGUARD_CONFIG" | tr -d '\r')
-          WG_DNS=$(printf '%s\n' "$CLEAN_CFG" | grep -i '^[[:space:]]*DNS[[:space:]]*=' | head -n1 | cut -d'=' -f2- | tr ',' '\n' | grep -E '^[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+[[:space:]]*$' | head -n1 | tr -d ' ' || true)
-
-          # AllowedIPs erzwingt kompletten Internet-Traffic (0.0.0.0/0) über die FRITZ!Box
-          printf '%s\n' "$CLEAN_CFG" \
-            | grep -viE '^[[:space:]]*(DNS|MTU|AllowedIPs)[[:space:]]*=' \
-            | sed -E '/^[[:space:]]*\[Interface\]/a MTU = 1280' \
-            | sed -E '/^[[:space:]]*\[Peer\]/a AllowedIPs = 0.0.0.0/0' \
-            | sudo tee /etc/wireguard/wg0.conf > /dev/null
-          sudo chmod 600 /etc/wireguard/wg0.conf
+          sudo apt-get install -y -qq wireguard-tools iproute2
 
           echo "IP vor VPN: $(curl -4 -s --max-time 10 https://api.ipify.org || echo unbekannt)"
-          sudo wg-quick up wg0
 
-          sudo rm -f /etc/resolv.conf
-          if [ -n "$WG_DNS" ]; then
-            printf "nameserver %s\nnameserver 1.1.1.1\noptions timeout:2 attempts:2\n" "$WG_DNS" | sudo tee /etc/resolv.conf > /dev/null
-          else
-            printf "nameserver 192.168.178.1\nnameserver 1.1.1.1\noptions timeout:2 attempts:2\n" | sudo tee /etc/resolv.conf > /dev/null
-          fi
+          # Config für isolierten VPN-Namespace aufbereiten (nur IPv4, Endpoint direkt als IPv4 auflösen)
+          python3 - <<'PY'
+          import os, re, socket
+
+          cfg = os.environ["WIREGUARD_CONFIG"].replace("\r", "")
+          addr_v4 = ""
+          dns_v4 = ""
+          out_lines = []
+
+          for line in cfg.splitlines():
+              s = line.strip()
+              if not s or s.startswith("#"):
+                  continue
+              low = s.lower()
+              if low.startswith("address"):
+                  val = s.split("=", 1)[1]
+                  for part in val.split(","):
+                      part = part.strip()
+                      if not addr_v4 and re.match(r"^\d+\.\d+\.\d+\.\d+(/\d+)?$", part):
+                          addr_v4 = part
+                  continue
+              if low.startswith("dns"):
+                  val = s.split("=", 1)[1]
+                  for part in val.split(","):
+                      part = part.strip()
+                      if not dns_v4 and re.match(r"^\d+\.\d+\.\d+\.\d+$", part):
+                          dns_v4 = part
+                  continue
+              if low.startswith("mtu"):
+                  continue
+              if low.startswith("allowedips"):
+                  out_lines.append("AllowedIPs = 0.0.0.0/0")
+                  continue
+              if low.startswith("endpoint"):
+                  val = s.split("=", 1)[1].strip()
+                  host, port = val.rsplit(":", 1)
+                  ip = socket.gethostbyname(host.strip("[]"))
+                  print(f"FRITZ!Box Endpoint aufgeloest: {host} -> {ip}:{port}")
+                  out_lines.append(f"Endpoint = {ip}:{port}")
+                  continue
+              out_lines.append(s)
+
+          if not addr_v4:
+              raise SystemExit("FEHLER: Keine IPv4-Adresse in WIREGUARD_CONFIG gefunden.")
+
+          with open("/tmp/wg0_pure.conf", "w") as f:
+              f.write("\n".join(out_lines) + "\n")
+          with open("/tmp/wg0_meta.env", "w") as f:
+              f.write(f"WG_ADDR={addr_v4}\n")
+              f.write(f"WG_DNS={dns_v4 or '192.168.178.1'}\n")
+          PY
+
+          source /tmp/wg0_meta.env
+          chmod 600 /tmp/wg0_pure.conf
+
+          # Isolierten Netzwerk-Namespace anlegen, damit GitHub Actions selbst nicht getrennt wird
+          sudo ip netns del vpn 2>/dev/null || true
+          sudo ip link del wg0 2>/dev/null || true
+          sudo ip netns add vpn
+          sudo ip link add wg0 type wireguard
+          sudo wg setconf wg0 /tmp/wg0_pure.conf
+          rm -f /tmp/wg0_pure.conf /tmp/wg0_meta.env
+
+          # Tunnel-Interface in den Namespace verschieben (UDP-Socket bleibt auf dem Runner)
+          sudo ip link set wg0 netns vpn
+          sudo ip -n vpn link set lo up
+          sudo ip -n vpn addr add "$WG_ADDR" dev wg0
+          sudo ip -n vpn link set mtu 1280 up dev wg0
+          sudo ip -n vpn route add default dev wg0
+
+          # Eigenes DNS nur für den VPN-Namespace setzen
+          sudo mkdir -p /etc/netns/vpn
+          printf "nameserver %s\nnameserver 1.1.1.1\noptions timeout:2 attempts:2\n" "$WG_DNS" | sudo tee /etc/netns/vpn/resolv.conf > /dev/null
 
           sleep 2
-          VPN_IP=$(curl -4 -fsS --max-time 15 http://checkip.amazonaws.com 2>/dev/null | tr -d '\r\n' || true)
+          VPN_IP=$(sudo ip netns exec vpn curl -4 -fsS --max-time 15 http://checkip.amazonaws.com 2>/dev/null | tr -d '\r\n' || true)
           if [ -z "$VPN_IP" ]; then
             echo "FEHLER: Keine Verbindung über WireGuard zur Fritz!Box."
-            sudo wg show || true
-            sudo wg-quick down wg0 || true
+            sudo ip netns exec vpn wg show || true
             exit 1
           fi
           echo "IP über Fritz!Box VPN: $VPN_IP"
@@ -77,9 +129,18 @@ jobs:
           WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
           BROWSER_CHANNEL: chromium
         run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u tracker.py --show
+          PYTHON_BIN=$(which python)
+          sudo ip netns exec vpn sudo -u "$USER" env \
+            "PATH=$PATH" \
+            "HOME=$HOME" \
+            "SHEET_ID=$SHEET_ID" \
+            "WEBHOOK_URL=$WEBHOOK_URL" \
+            "WEBHOOK_TOKEN=$WEBHOOK_TOKEN" \
+            "BROWSER_CHANNEL=chromium" \
+            xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" "$PYTHON_BIN" -u tracker.py --show
 
       - name: Stop WireGuard VPN
         if: always()
         run: |
-          sudo wg-quick down wg0 || true
+          sudo ip netns del vpn 2>/dev/null || true
+          sudo rm -rf /etc/netns/vpn || true
