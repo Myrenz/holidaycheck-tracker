@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Stealth/Xvfb)
+HolidayCheck-Preistracker (Cloud / GitHub Actions & Lokal mit Patchright-Stealth)
 
 - Flexibles Urlaubsfenster: 14.06.2027 - 28.06.2027 (7 Tage, Abflug FMO).
 - Automatischer Check auf bekannten RU-Fokus für russische Hotelketten.
-- Stabilitäts- & Diagnose-Update:
-  * Kein künstliches Blockieren von Bildern/Fonts/CSS (verhindert Akamai-/Consent-Störungen)
-  * Cookie-Banner wird auch innerhalb von iframes (z. B. Sourcepoint) automatisch geklickt
-  * Erkennt API-Blockaden (403/429) direkt statt fälschlich 'no_response' zu melden
-  * Gibt beim ersten Fehlschlag URL, Seitentitel, Frames, Seitentext & gesehene APIs im Log aus
+- Patchright-Stealth-Update:
+  * Nutzt Patchright + echtes Google Chrome (entfernt Playwrights CDP-Bot-Signatur gegen Akamai)
+  * Wärmt ein frisches Profil auf holidaycheck.de auf (setzt Akamai-Cookies + akzeptiert Cookie-Banner)
+  * Erkennt Akamai-Sperrseiten (auch bei HTTP 200) und 400/403/429 sofort ohne 40s-Timeout
+  * Klickt Cookie-Banner auch innerhalb von iframes (z. B. Sourcepoint)
 """
 import argparse
 import csv
@@ -28,15 +28,12 @@ from urllib.parse import urlparse
 import requests
 
 # ----------------------------- KONFIGURATION ---------------------------------
-# In GitHub Actions werden diese Werte automatisch aus den Repository-Secrets geladen.
-# Für lokale Tests auf dem eigenen PC ohne Umgebungsvariablen ggf. nach dem "or" eintragen.
 SHEET_ID = (os.getenv("SHEET_ID") or "").strip()
 WEBHOOK_URL = (os.getenv("WEBHOOK_URL") or "").strip()
 WEBHOOK_TOKEN = (os.getenv("WEBHOOK_TOKEN") or "123456789").strip()
 
-# Auf Windows standardmäßig msedge, auf Linux (GitHub Actions) chromium nutzen
-DEFAULT_CHANNEL = "msedge" if sys.platform == "win32" else "chromium"
-BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", DEFAULT_CHANNEL)
+# Standardmäßig echtes Chrome nutzen (Fallback automatisch auf Edge/Chromium)
+BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chrome").strip()
 API_HINT = os.getenv("API_HINT", "all-offers-service")
 
 # EXAKTE SUCHPARAMETER (Flexibel im Urlaubsfenster 14.06.2027 - 28.06.2027, 7 Tage, Abflug FMO, 2 Erw.)
@@ -44,8 +41,8 @@ SEARCH_QUERY = "?_offer=adults:2,airport:~FMO,departureDate:2027-06-14,duration:
 # -----------------------------------------------------------------------------
 
 MIN_OK, MAX_OK = 1000, 20000
-PAUSE_HOTEL = (2, 4)
-PAUSE_BLOCK = (5, 10)
+PAUSE_HOTEL = (3, 6)
+PAUSE_BLOCK = (12, 20)
 MAX_CONSECUTIVE_FAILS = 15
 WAIT_FOR_API_S = 40
 FLUSH_EVERY = 25
@@ -57,6 +54,10 @@ DEBUG_DIR = BASE / "debug"
 BACKUP_CSV = BASE / "preishistorie_backup.csv"
 
 UUID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
+BLOCK_TEXT_RE = re.compile(
+    r"diese funktionalität steht gerade nicht zur verfügung|access denied|zugriff verweigert|bitte kontaktieren sie unseren support mit dieser referenz",
+    re.I,
+)
 
 RU_CHAINS = [
     "rixos", "granada", "orange county", "justiniano", "lonicera", "dobedan",
@@ -375,33 +376,83 @@ def build_details(base: str, rating: str, rec: str, count: str) -> str:
 
 
 # ------------------------------ Browser --------------------------------------
+def get_sync_playwright():
+    try:
+        from patchright.sync_api import sync_playwright
+        print("Browser-Engine: Patchright (Stealth aktiv)")
+        return sync_playwright
+    except ImportError:
+        from playwright.sync_api import sync_playwright
+        print("WARNUNG: Patchright nicht installiert (Fallback auf Playwright).")
+        return sync_playwright
+
+
+def click_consent_if_present(page) -> bool:
+    for frame in page.frames:
+        try:
+            btn = frame.locator(
+                'button:has-text("Alle akzeptieren"), button:has-text("Akzeptieren"), button:has-text("Zustimmen"), button:has-text("Einverstanden")'
+            ).first
+            if btn.is_visible(timeout=1000):
+                btn.click(timeout=2000)
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def open_context(p, show: bool):
     PROFILE_DIR.mkdir(exist_ok=True)
-    launch_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--disable-features=IsolateOrigins,site-per-process",
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--window-size=1920,1080",
-    ]
-    kwargs = {
+    args = ["--lang=de-DE"]
+    if sys.platform != "win32":
+        args.extend(["--no-sandbox", "--disable-dev-shm-usage", "--window-size=1920,1080"])
+
+    base_kwargs = {
         "headless": not show,
-        "locale": "de-DE",
-        "timezone_id": "Europe/Berlin",
-        "viewport": {"width": 1920, "height": 1080},
-        "args": launch_args,
+        "no_viewport": True,
+        "args": args,
     }
+
+    channels = []
     if BROWSER_CHANNEL and BROWSER_CHANNEL != "chromium":
-        kwargs["channel"] = BROWSER_CHANNEL
+        channels.append(BROWSER_CHANNEL)
+    if "chrome" not in channels:
+        channels.append("chrome")
+    if sys.platform == "win32" and "msedge" not in channels:
+        channels.append("msedge")
+    channels.append(None)
+
+    last_err = None
+    for ch in channels:
+        kwargs = dict(base_kwargs)
+        if ch:
+            kwargs["channel"] = ch
+        try:
+            ctx = p.chromium.launch_persistent_context(str(PROFILE_DIR), **kwargs)
+            print(f"Browser-Kanal: {ch or 'chromium'}")
+            return ctx
+        except Exception as e:
+            last_err = e
+    raise last_err
+
+
+def warmup_session(ctx) -> None:
+    """Besucht kurz die Startseite, damit Akamai-Cookies & Cookie-Consent sauber gesetzt werden."""
+    page = ctx.new_page()
     try:
-        ctx = p.chromium.launch_persistent_context(str(PROFILE_DIR), **kwargs)
-    except Exception:
-        kwargs.pop("channel", None)
-        ctx = p.chromium.launch_persistent_context(str(PROFILE_DIR), **kwargs)
-    ctx.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
-    return ctx
+        print("Wärme HolidayCheck-Session auf ...")
+        page.goto("https://www.holidaycheck.de/", wait_until="domcontentloaded", timeout=45_000)
+        page.wait_for_timeout(3500)
+        if click_consent_if_present(page):
+            print("   ↳ Cookie-Banner akzeptiert")
+            page.wait_for_timeout(2000)
+    except Exception as e:
+        print(f"   ↳ Warmup-Hinweis: {type(e).__name__}")
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
 
 
 def fetch_offers(ctx, url: str, need_meta: bool = False):
@@ -420,7 +471,7 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
             if API_HINT in resp.url:
                 if resp.status == 200:
                     hits.append(resp)
-                elif resp.status in (403, 429):
+                elif resp.status in (400, 403, 429):
                     api_blocked = True
         except Exception:
             pass
@@ -430,29 +481,29 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
     meta = {}
     try:
         main = page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        if main is not None and main.status in (403, 429):
+        if main is not None and main.status in (400, 403, 429):
             blocked = True
 
-        # Wartet geduldig auf Angebote; sucht Cookie-Banner auch in iframes (z. B. Sourcepoint)
         t0 = time.time()
         has_real_offers = False
         clicked_consent = False
-        while time.time() - t0 < WAIT_FOR_API_S:
+        checked_block_text = False
+        while not blocked and (time.time() - t0 < WAIT_FOR_API_S):
             if api_blocked:
                 blocked = True
                 break
+            if not checked_block_text and not hits and (time.time() - t0) >= 2.5:
+                checked_block_text = True
+                try:
+                    txt = page.evaluate("() => document.body ? document.body.innerText.slice(0, 600) : ''") or ""
+                    if BLOCK_TEXT_RE.search(txt):
+                        blocked = True
+                        break
+                except Exception:
+                    pass
             if not clicked_consent and not hits and (time.time() - t0) >= 4:
                 clicked_consent = True
-                for frame in page.frames:
-                    try:
-                        btn = frame.locator(
-                            'button:has-text("Alle akzeptieren"), button:has-text("Akzeptieren"), button:has-text("Zustimmen"), button:has-text("Einverstanden")'
-                        ).first
-                        if btn.is_visible(timeout=1000):
-                            btn.click(timeout=2000)
-                            break
-                    except Exception:
-                        pass
+                click_consent_if_present(page)
             for r in list(hits):
                 try:
                     data = r.json()
@@ -470,12 +521,13 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
         if not hits and re.search(r"access denied|zugriff verweigert|robot|captcha", page.title() or "", re.I):
             blocked = True
 
-        # Falls weiterhin nichts ankam: ganz vorne in 'seen' zeigen, was der Browser tatsächlich sieht
         if not hits:
             try:
                 body_preview = re.sub(
                     r"\s+", " ", page.evaluate("() => document.body ? document.body.innerText : ''") or ""
                 )[:250]
+                if BLOCK_TEXT_RE.search(body_preview):
+                    blocked = True
             except Exception:
                 body_preview = ""
             frame_urls = [f.url for f in page.frames if f.url and f.url != page.url][:3]
@@ -492,23 +544,24 @@ def fetch_offers(ctx, url: str, need_meta: bool = False):
                 pass
 
         rating, rec, count = "", "", ""
-        try:
-            rating, rec, count = page.evaluate(r"""() => {
-                let ratingText = "", recText = "", countText = "";
-                const reviewBar = document.querySelector('[data-trackid="hotel-review-bar"]') || document.querySelector('.HotelReviewBar');
-                if (reviewBar) {
-                    const text = reviewBar.innerText;
-                    const recMatch = text.match(/(\d{2,3})\s*%/);
-                    if (recMatch) recText = recMatch[1];
-                    const sunMatch = text.match(/([0-9][.,][0-9])\s*\/\s*6/);
-                    if (sunMatch) ratingText = sunMatch[1].replace(',', '.');
-                    const countMatch = text.match(/([\d.]+)\s*Bewertungen/i);
-                    if (countMatch) countText = countMatch[1].replace(/\./g, '');
-                }
-                return [ratingText, recText, countText];
-            }""")
-        except Exception:
-            pass
+        if not blocked:
+            try:
+                rating, rec, count = page.evaluate(r"""() => {
+                    let ratingText = "", recText = "", countText = "";
+                    const reviewBar = document.querySelector('[data-trackid="hotel-review-bar"]') || document.querySelector('.HotelReviewBar');
+                    if (reviewBar) {
+                        const text = reviewBar.innerText;
+                        const recMatch = text.match(/(\d{2,3})\s*%/);
+                        if (recMatch) recText = recMatch[1];
+                        const sunMatch = text.match(/([0-9][.,][0-9])\s*\/\s*6/);
+                        if (sunMatch) ratingText = sunMatch[1].replace(',', '.');
+                        const countMatch = text.match(/([\d.]+)\s*Bewertungen/i);
+                        if (countMatch) countText = countMatch[1].replace(/\./g, '');
+                    }
+                    return [ratingText, recText, countText];
+                }""")
+            except Exception:
+                pass
 
         if need_meta and not blocked:
             try:
@@ -651,173 +704,9 @@ def verify_webhook_and_push_images(hotels: list[dict]) -> bool:
 
 # ------------------------------ Modi -----------------------------------------
 def mode_setup():
-    from playwright.sync_api import sync_playwright
+    sync_playwright = get_sync_playwright()
     with sync_playwright() as p:
         ctx = open_context(p, show=True)
         page = ctx.new_page()
         page.goto("https://www.holidaycheck.de/", timeout=60_000)
-        input("Cookie-Banner bestätigen. Dann hier ENTER drücken ... ")
-        ctx.close()
-
-
-def mode_probe(hotels, show: bool):
-    from playwright.sync_api import sync_playwright
-    h = hotels[0]
-    print(f"PROBE mit: {h['name']}\n{h['scrape_url']}\n")
-    with sync_playwright() as p:
-        ctx = open_context(p, show)
-        payloads, blocked, seen, rating, rec, count, meta = fetch_offers(ctx, h["scrape_url"], need_meta=True)
-        ctx.close()
-    print(f"Blockiert: {blocked}")
-    print(f"Gesehene APIs ({len(seen)}): {seen[:10]}")
-    print(f"Bewertung: {rating} / 6 | {rec}% | {count} Reviews")
-    print(f"Erkannte Stammdaten: {meta}")
-    price, details = extract_price(payloads)
-    print(f"Preis (extract_price): {price} [{details}] | Status: {classify_failure(payloads, blocked) if price is None else 'ok'}")
-    DEBUG_DIR.mkdir(exist_ok=True)
-    out = DEBUG_DIR / "probe_payloads.json"
-    out.write_text(json.dumps(payloads, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Rohdaten gespeichert: {out} ({len(payloads)} API-Antworten)")
-
-
-def mode_run(hotels, show: bool) -> int:
-    from playwright.sync_api import sync_playwright
-
-    if not verify_webhook_and_push_images(hotels):
-        print("ABBRUCH VOR START: Bitte Google Apps Script als 'Neue Version' bereitstellen!")
-        return 2
-
-    ts = berlin_now().strftime("%Y-%m-%d %H:%M")
-    buffer: list = []
-    updates_buffer: list = []
-    stats: dict = defaultdict(int)
-    consecutive = 0
-    aborted = False
-    post_ok = True
-
-    with sync_playwright() as p:
-        ctx = open_context(p, show)
-        try:
-            for i, h in enumerate(hotels, 1):
-                name = h["name"]
-                scrape_url = h["scrape_url"]
-                need_meta = h["need_page_meta"]
-
-                print(f"[{i}/{len(hotels)}] {name} ... ", end="", flush=True)
-                price, details, status = None, "", ""
-                payloads, blocked, seen = [], False, []
-                rating = rec = count = ""
-                meta = {}
-
-                for attempt in (1, 2):
-                    try:
-                        payloads, blocked, seen, rating, rec, count, meta = fetch_offers(
-                            ctx, scrape_url, need_meta=need_meta
-                        )
-                        price, details = extract_price(payloads)
-                        status = ""
-                        if price is not None or blocked:
-                            break
-                    except Exception as e:
-                        payloads, blocked = [], False
-                        err_msg = str(e).splitlines()[0][:80] if str(e) else ""
-                        status = f"error:{type(e).__name__}({err_msg})"
-                        try:
-                            ctx.close()
-                        except Exception:
-                            pass
-                        try:
-                            ctx = open_context(p, show)
-                        except Exception:
-                            pass
-                    time.sleep(random.uniform(2, 4))
-
-                upd = dict(h["auto_update"])
-                if not h["has_name"] and meta.get("name"):
-                    name = meta["name"]
-                    upd["name"] = name
-                if not h["has_region"] and meta.get("region"):
-                    upd["region"] = meta["region"]
-                if not h["has_ort"] and meta.get("ort"):
-                    upd["ort"] = meta["ort"]
-                if not h["has_stars"] and meta.get("stars"):
-                    upd["stars"] = meta["stars"]
-                if not h["has_tags"] and meta.get("tags"):
-                    upd["tags"] = meta["tags"]
-                if "image" not in upd and meta.get("og_image"):
-                    upd["image"] = meta["og_image"]
-
-                if not h["has_ru_focus"]:
-                    if any(chain in name.lower() for chain in RU_CHAINS):
-                        upd["ru_focus"] = "TRUE"
-
-                if upd:
-                    upd["url"] = h["raw_url"]
-                    if not upd.get("name"):
-                        upd["name"] = name
-                    updates_buffer.append(upd)
-
-                if price is not None:
-                    row = [ts, name, price, build_details(details, rating, rec, count)]
-                    stats["ok"] += 1
-                    consecutive = 0
-                    print(f"{price:.2f} EUR")
-                else:
-                    status = status or classify_failure(payloads, blocked)
-                    row = [ts, name, "", build_details(f"status={status}", rating, rec, count)]
-                    stats[status.split(":")[0]] += 1
-                    consecutive = 0 if status == "no_offer" else consecutive + 1
-                    print(status)
-                    if i == 1 and status in ("no_response", "blocked"):
-                        print("   ↳ DEBUG gesehen:", seen[:8])
-
-                append_backup([row])
-                buffer.append(row)
-
-                if consecutive >= MAX_CONSECUTIVE_FAILS:
-                    print(f"\nAbbruch: {consecutive} Fehlschläge in Folge")
-                    aborted = True
-                    break
-
-                time.sleep(random.uniform(*PAUSE_HOTEL))
-                if i % FLUSH_EVERY == 0:
-                    post_ok = flush_rows(buffer, updates_buffer) and post_ok
-                    time.sleep(random.uniform(*PAUSE_BLOCK))
-        finally:
-            try:
-                ctx.close()
-            except Exception:
-                pass
-
-    post_ok = flush_rows(buffer, updates_buffer) and post_ok
-    print("\nZusammenfassung:", dict(stats))
-    if not post_ok:
-        print(f"Webhook-Versand unvollständig – alle Zeilen liegen in {BACKUP_CSV}")
-        return 2
-    if aborted:
-        return 3
-    return 0 if stats["ok"] > 0 else 1
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--setup", action="store_true")
-    ap.add_argument("--probe", action="store_true")
-    ap.add_argument("--show", action="store_true")
-    ap.add_argument("--limit", type=int, default=0)
-    args, _ = ap.parse_known_args()
-
-    if args.setup:
-        return mode_setup() or 0
-    hotels = load_hotels(None)
-    if args.limit:
-        hotels = hotels[: args.limit]
-    if not hotels:
-        return 1
-    if args.probe:
-        return mode_probe(hotels, args.show) or 0
-    return mode_run(hotels, args.show)
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+        input("Cookie
