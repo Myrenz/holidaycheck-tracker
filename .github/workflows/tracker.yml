@@ -114,4 +114,43 @@ jobs:
 
           sudo ip link set wg0 netns vpn
           sudo ip -n vpn link set lo up
-          sudo ip -n
+          sudo ip -n vpn addr add "$WG_ADDR" dev wg0
+          sudo ip -n vpn link set mtu 1280 up dev wg0
+          sudo ip -n vpn route add default dev wg0
+
+          sudo mkdir -p /etc/netns/vpn
+          printf "nameserver %s\nnameserver 1.1.1.1\noptions timeout:2 attempts:2\n" "$WG_DNS" | sudo tee /etc/netns/vpn/resolv.conf > /dev/null
+
+          sleep 2
+          VPN_IP=$(sudo ip netns exec vpn curl -4 -fsS --max-time 15 http://checkip.amazonaws.com 2>/dev/null | tr -d '\r\n' || true)
+          if [ -z "$VPN_IP" ]; then
+            echo "FEHLER: Keine Verbindung über WireGuard zur Fritz!Box."
+            sudo ip netns exec vpn wg show || true
+            exit 1
+          fi
+          echo "IP über Fritz!Box VPN: $VPN_IP"
+
+      - name: Run Tracker
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
+          BROWSER_CHANNEL: chrome
+          LIMIT: ${{ github.event.inputs.limit || '0' }}
+        run: |
+          PYTHON_BIN=$(which python)
+          sudo ip netns exec vpn sudo -u "$USER" env \
+            "PATH=$PATH" \
+            "HOME=$HOME" \
+            "TZ=Europe/Berlin" \
+            "SHEET_ID=$SHEET_ID" \
+            "WEBHOOK_URL=$WEBHOOK_URL" \
+            "WEBHOOK_TOKEN=$WEBHOOK_TOKEN" \
+            "BROWSER_CHANNEL=chrome" \
+            xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" "$PYTHON_BIN" -u tracker.py --show --limit "$LIMIT"
+
+      - name: Stop WireGuard VPN
+        if: always()
+        run: |
+          sudo ip netns del vpn 2>/dev/null || true
+          sudo rm -rf /etc/netns/vpn || true
